@@ -18,6 +18,16 @@
 (function () {
   "use strict";
 
+  // i18n: lib/i18n.js viene caricato come content_script PRIMA di questo file
+  // (vedi manifest.json content_scripts.js array). Espone PegasusI18n su globalThis.
+  // Fallback: identità sulla key — così il file resta funzionante anche se i18n.js
+  // non si è caricato per qualche motivo.
+  const i18n = globalThis.PegasusI18n || {
+    t: (k) => k,
+    getLocale: () => "it",
+  };
+  const t = (key, repl) => i18n.t(key, repl);
+
   const STATE = {
     scanning: false,
     scanId: null,
@@ -169,22 +179,22 @@
       <div class="ph-overlay" role="status" aria-live="polite">
         <div class="ph-header">
           <div class="ph-logo">P</div>
-          <div class="ph-title">PEGASUS HUNTER</div>
+          <div class="ph-title">${t("overlay.title")}</div>
           <div class="ph-dot" id="ph-dot"></div>
         </div>
         <div class="ph-meta">
-          Keyword: <strong id="ph-kw"></strong> &middot; Paese: <strong id="ph-country"></strong>
+          ${t("overlay.keywordLabel")} <strong id="ph-kw"></strong> &middot; ${t("overlay.countryLabel")} <strong id="ph-country"></strong>
         </div>
         <div class="ph-metrics">
-          <div class="ph-cell"><div class="ph-num" id="ph-ads">0</div><div class="ph-lbl">Annunci</div></div>
-          <div class="ph-cell"><div class="ph-num" id="ph-stores">0</div><div class="ph-lbl">Shop</div></div>
-          <div class="ph-cell"><div class="ph-num" id="ph-sent">0</div><div class="ph-lbl">Sync</div></div>
+          <div class="ph-cell"><div class="ph-num" id="ph-ads">0</div><div class="ph-lbl">${t("overlay.metricAds")}</div></div>
+          <div class="ph-cell"><div class="ph-num" id="ph-stores">0</div><div class="ph-lbl">${t("overlay.metricStores")}</div></div>
+          <div class="ph-cell"><div class="ph-num" id="ph-sent">0</div><div class="ph-lbl">${t("overlay.metricSent")}</div></div>
         </div>
         <div class="ph-actions">
-          <button class="ph-btn danger" id="ph-stop">Stop</button>
-          <button class="ph-btn primary" id="ph-open">Dashboard</button>
+          <button class="ph-btn danger" id="ph-stop">${t("overlay.btnStop")}</button>
+          <button class="ph-btn primary" id="ph-open">${t("overlay.btnDashboard")}</button>
         </div>
-        <div class="ph-status" id="ph-status">Scansionando…</div>
+        <div class="ph-status" id="ph-status">${t("overlay.status.scanning")}</div>
       </div>
     `;
     document.documentElement.appendChild(host);
@@ -195,7 +205,7 @@
     shadow.getElementById("ph-stop").addEventListener("click", () => {
       STATE.scanning = false;
       STATE.abortReason = "user_stop";
-      updateOverlayStatus("Stop richiesto…");
+      updateOverlayStatus(t("overlay.status.stopRequested"));
     });
     shadow.getElementById("ph-open").addEventListener("click", () => {
       chrome.runtime.sendMessage({ type: "PEGASUS_OPEN_DASHBOARD" });
@@ -417,7 +427,7 @@
         totalAds: STATE.totalFound,
       });
       if (res?.scanId && !STATE.scanId) STATE.scanId = res.scanId;
-      log(`Batch inviato: ${items.length} item, totale ${STATE.totalFound}`);
+      log(t("cs.log.batchSent", { n: items.length, tot: STATE.totalFound }));
       // Aggiorna overlay live col totalStores reale dal server (computato via
       // DISTINCT split_part lato Postgres — fonte di verità).
       updateOverlay({
@@ -425,7 +435,7 @@
         sent: STATE.totalFound - STATE.batch.length,
       });
     } catch (e) {
-      logErr(`Ingest fallito: ${e?.message ?? e}. Reinserisco in coda.`);
+      logErr(t("cs.log.ingestFail", { err: e?.message ?? e }));
       // Reinserisci a coda — meglio riprovare al prossimo flush.
       STATE.batch.unshift(...items);
       // Se la chiave è invalida, fermiamo.
@@ -455,7 +465,7 @@
    * Spesso "sveglia" il lazy-load di FB quando si è incantato.
    */
   async function recoveryKick() {
-    log("Recovery: scroll su+giù per svegliare il lazy-load");
+    log(t("cs.log.recoveryKick"));
     window.scrollTo({ top: 0, behavior: "instant" });
     await new Promise((r) => setTimeout(r, 1500));
     window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" });
@@ -487,13 +497,13 @@
   }
 
   async function mainLoop() {
-    log("Avvio scansione FB Ads Library");
+    log(t("cs.log.scanStart"));
     startFlushTimer();
     // Inject the live overlay UI on top-right of the page. Killer UX of v0.2.0.
     try {
       createOverlay(STATE.keyword, STATE.country);
     } catch (e) {
-      logErr(`Overlay injection failed: ${e?.message ?? e}`);
+      logErr(t("cs.log.overlayFail", { err: e?.message ?? e }));
     }
 
     while (STATE.scanning && !STATE.abortReason) {
@@ -529,7 +539,7 @@
         }
 
         if (STATE.sinceLastScrollGrowth >= STAGNATION_MAX_CYCLES) {
-          log(`Stagnazione dopo ${STATE.sinceLastScrollGrowth} cicli — termino`);
+          log(t("cs.log.stagnation", { n: STATE.sinceLastScrollGrowth }));
           STATE.abortReason = "stagnant";
           break;
         }
@@ -571,32 +581,31 @@
       STATE.abortReason === "user_stop";
     updateOverlay({ totalFound: STATE.totalFound, sent: STATE.totalFound });
     if (STATE.abortReason === "auth_error") {
-      updateOverlayStatus("Errore: API key invalida o revocata", "err");
+      updateOverlayStatus(t("overlay.status.authError"), "err");
     } else if (ok) {
-      const reasonLabel =
+      const statusKey =
         STATE.abortReason === "limit"
-          ? "Limite raggiunto"
+          ? "overlay.status.limit"
           : STATE.abortReason === "user_stop"
-          ? "Interrotto"
-          : "Completata";
-      updateOverlayStatus(
-        `✓ ${reasonLabel} · ${STATE.totalFound} prodotti`,
-        "ok",
-      );
+          ? "overlay.status.stopped"
+          : "overlay.status.completed";
+      updateOverlayStatus(t(statusKey, { n: STATE.totalFound }), "ok");
     } else {
-      updateOverlayStatus(`Terminato (${STATE.abortReason || "stopped"})`);
+      updateOverlayStatus(
+        t("overlay.status.stoppedReason", { reason: STATE.abortReason || "stopped" }),
+      );
     }
     // Lascio l'overlay visibile per 30s così l'utente legge il risultato
     setTimeout(() => removeOverlay(), 30_000);
 
-    log(`Scansione terminata: ${STATE.totalFound} prodotti, motivo: ${STATE.abortReason}`);
+    log(t("cs.log.scanDone", { n: STATE.totalFound, reason: STATE.abortReason }));
   }
 
   // === Message handler ===
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg?.type === "PEGASUS_START") {
       if (STATE.scanning) {
-        sendResponse({ ok: false, error: "Scansione già in corso" });
+        sendResponse({ ok: false, error: t("cs.err.scanInProgress") });
         return false;
       }
       STATE.scanning = true;
