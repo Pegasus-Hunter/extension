@@ -7,6 +7,8 @@
 //   4) Inoltra i batch dal content script all'API server (wooshstoreai.com).
 //   5) Propaga metrics/log al popup quando aperto.
 //   6) Gestisce STOP / chiusura tab.
+//   7) (v0.4.0) Aggiorna il badge dell'icona dell'estensione con il contatore
+//      di annunci trovati durante la scansione + colore di stato.
 //
 // Tutto è async + state machine semplice. Lo stato vive in chrome.storage.local
 // così sopravvive a sleep/wake del service worker.
@@ -15,6 +17,38 @@ import { storage } from "../lib/storage.js";
 import { api } from "../lib/api-client.js";
 
 const FB_BASE = "https://www.facebook.com/ads/library/";
+
+// ── Badge helper (v0.4.0) ────────────────────────────────────────────────
+// Pegasus brand green for the active-scan badge, red for the error badge.
+// `chrome.action.setBadge*` is a no-op on browsers where the action API is
+// missing (older Chromium derivatives) — guarded with optional chaining.
+const BADGE_GREEN = "#22c55e";
+const BADGE_RED = "#ef4444";
+
+function setBadge(text, color = BADGE_GREEN) {
+  try {
+    chrome.action?.setBadgeText?.({ text });
+    if (text) {
+      chrome.action?.setBadgeBackgroundColor?.({ color });
+    }
+  } catch {
+    // chrome.action surface unavailable (e.g. very old Chromium fork) — silent.
+  }
+}
+
+function clearBadge() {
+  setBadge("");
+}
+
+// Format a number for the small (~4-char) badge: 0..999 raw, then "1.2k", "3.4k",
+// "12k", "99k", "999k", "1M+". Avoids overflow that would silently truncate.
+function fmtBadge(n) {
+  const v = Number(n) || 0;
+  if (v < 1000) return String(v);
+  if (v < 10_000) return (v / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+  if (v < 1_000_000) return Math.round(v / 1000) + "k";
+  return "1M+";
+}
 
 // Stato runtime in memoria (best effort; per persistenza vera vedi storage)
 const RUNTIME = {
@@ -94,6 +128,8 @@ async function startScan({ keyword, country, limit }) {
   RUNTIME.status = "opening_tab";
   await persistRuntime();
   broadcastToPopup({ type: "PEGASUS_STATE", state: { ...RUNTIME } });
+  // Show "..." while the FB tab is loading (before the first batch lands).
+  setBadge("...", BADGE_GREEN);
 
   const url = buildFbAdsUrl(RUNTIME.keyword, RUNTIME.country);
   const tab = await chrome.tabs.create({ url, active: false });
@@ -108,6 +144,7 @@ async function startScan({ keyword, country, limit }) {
     RUNTIME.lastError = e?.message ?? String(e);
     await persistRuntime();
     broadcastToPopup({ type: "PEGASUS_STATE", state: { ...RUNTIME } });
+    setBadge("!", BADGE_RED);
     return;
   }
 
@@ -124,6 +161,7 @@ async function startScan({ keyword, country, limit }) {
     });
     if (!resp?.ok) throw new Error(resp?.error ?? "Avvio content script fallito");
     RUNTIME.status = "scanning";
+    setBadge("0", BADGE_GREEN);
     await persistRuntime();
     broadcastToPopup({ type: "PEGASUS_STATE", state: { ...RUNTIME } });
   } catch (e) {
@@ -131,6 +169,7 @@ async function startScan({ keyword, country, limit }) {
     RUNTIME.lastError = `Content script: ${e?.message ?? e}`;
     await persistRuntime();
     broadcastToPopup({ type: "PEGASUS_STATE", state: { ...RUNTIME } });
+    setBadge("!", BADGE_RED);
   }
 }
 
@@ -145,6 +184,7 @@ async function stopScan() {
   RUNTIME.status = "idle";
   await persistRuntime();
   broadcastToPopup({ type: "PEGASUS_STATE", state: { ...RUNTIME } });
+  clearBadge();
 }
 
 // === Handler dei messaggi dal content script (e dal popup) ===
@@ -196,6 +236,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             RUNTIME.totalStores = res?.totalStores ?? RUNTIME.totalStores;
             await persistRuntime();
             broadcastToPopup({ type: "PEGASUS_STATE", state: { ...RUNTIME } });
+            // v0.4.0: live badge counter — formatted to fit ~4 chars.
+            setBadge(fmtBadge(RUNTIME.totalAds), BADGE_GREEN);
             // Restituiamo totalStores al content script così l'overlay live
             // può mostrarlo aggiornato dalla fonte di verità (server).
             sendResponse({
@@ -222,6 +264,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               });
             }
             RUNTIME.status = "completed";
+            // v0.4.0: keep the final ad count on the badge so the user sees
+            // the result at-a-glance even after closing the popup.
+            setBadge(fmtBadge(RUNTIME.totalAds), BADGE_GREEN);
             chrome.notifications?.create?.({
               type: "basic",
               iconUrl: "icons/icon-128.png",
@@ -231,6 +276,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           } catch (e) {
             RUNTIME.status = "error";
             RUNTIME.lastError = `Finalize: ${e?.message ?? e}`;
+            setBadge("!", BADGE_RED);
           }
           await persistRuntime();
           broadcastToPopup({ type: "PEGASUS_STATE", state: { ...RUNTIME } });
@@ -239,6 +285,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "PEGASUS_METRICS": {
           RUNTIME.totalAds = msg.totalFound ?? RUNTIME.totalAds;
+          if (RUNTIME.status === "scanning") {
+            setBadge(fmtBadge(RUNTIME.totalAds), BADGE_GREEN);
+          }
           broadcastToPopup({ type: "PEGASUS_STATE", state: { ...RUNTIME } });
           sendResponse({ ok: true });
           break;
@@ -276,10 +325,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     RUNTIME.lastError = "Tab di scansione chiusa prima del termine";
     persistRuntime();
     broadcastToPopup({ type: "PEGASUS_STATE", state: { ...RUNTIME } });
+    setBadge("!", BADGE_RED);
   }
 });
 
 // All'install/update facciamo nulla — la chiave la inserisce l'utente
 chrome.runtime.onInstalled.addListener(() => {
   console.log("[Pegasus] Service worker installato");
+  // v0.4.0: belt-and-suspenders — clear any stale badge state from a
+  // previous version after update.
+  clearBadge();
 });
