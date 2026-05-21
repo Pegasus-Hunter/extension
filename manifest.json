@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "Pegasus Hunter",
+  "short_name": "Pegasus",
+  "version": "0.2.0",
+  "description": "Scansiona Facebook Ads Library con overlay live e traccia prodotti vincenti su Shopify.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "notifications",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://www.facebook.com/*",
+    "https://api.pegasushunter.com/*",
+    "https://pegasushunter.com/*",
+    "http://localhost:8080/*",
+    "http://localhost:3000/*"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Pegasus Hunter",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.facebook.com/ads/library/*"],
+      "js": ["content-scripts/fb-ads-extract.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["lib/*.js", "content-scripts/overlay.css"],
+      "matches": ["https://www.facebook.com/*"]
+    }
+  ]
+}

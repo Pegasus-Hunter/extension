@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pegasus Hunter</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="hdr">
+    <div class="logo">
+      <span class="logo-mark">P</span>
+      <span class="logo-name">Pegasus</span>
+    </div>
+    <div class="status-pill" id="statusPill">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusLabel">In attesa</span>
+    </div>
+  </header>
+
+  <!-- Setup view (visible if no API key) -->
+  <section class="view" id="viewSetup" hidden>
+    <h2 class="view-title">Collega Pegasus Hunter</h2>
+    <p class="view-help">
+      Incolla la tua API key. La trovi in
+      <a href="#" id="openApiKeysLink">pegasushunter.com → API Keys</a>.
+    </p>
+    <label class="field">
+      <span class="field-label">API Key</span>
+      <input type="password" id="apiKeyInput" placeholder="wsk_..." spellcheck="false" autocomplete="off" />
+    </label>
+    <label class="field">
+      <span class="field-label">Server (avanzato)</span>
+      <select id="serverSelect">
+        <option value="https://api.pegasushunter.com">Produzione · api.pegasushunter.com</option>
+        <option value="http://localhost:8080">Locale · localhost:8080 (dev)</option>
+      </select>
+    </label>
+    <button class="btn-primary" id="btnSaveApiKey">Salva e continua</button>
+    <div class="err" id="setupError" hidden></div>
+  </section>
+
+  <!-- Main view -->
+  <section class="view" id="viewMain" hidden>
+    <label class="field">
+      <span class="field-label">Keyword</span>
+      <input type="text" id="keywordInput" placeholder="es. perruque, integratore, smartwatch..." autocomplete="off" />
+    </label>
+
+    <label class="field">
+      <span class="field-label">Paese</span>
+      <select id="countrySelect"></select>
+    </label>
+
+    <label class="field">
+      <span class="field-label">Limite annunci</span>
+      <select id="limitSelect">
+        <option value="50">50 (veloce)</option>
+        <option value="150" selected>150 (medio)</option>
+        <option value="400">400 (lungo)</option>
+        <option value="0">Tutti (sperimentale)</option>
+      </select>
+    </label>
+
+    <div class="btn-row">
+      <button class="btn-primary" id="btnStart">Avvia scansione</button>
+      <button class="btn-ghost" id="btnStop" hidden>Ferma</button>
+    </div>
+
+    <div class="scan-status" id="scanStatus" hidden>
+      <div class="metrics">
+        <div class="metric">
+          <div class="metric-num" id="metricAds">0</div>
+          <div class="metric-lbl">Annunci</div>
+        </div>
+        <div class="metric">
+          <div class="metric-num" id="metricStores">0</div>
+          <div class="metric-lbl">Shop trovati</div>
+        </div>
+        <div class="metric">
+          <div class="metric-num" id="metricSent">0</div>
+          <div class="metric-lbl">Sincronizzati</div>
+        </div>
+      </div>
+      <div class="log" id="scanLog"></div>
+    </div>
+
+    <div class="footer-links">
+      <a href="#" id="openDashboard">Apri dashboard</a>
+      <span class="dot-sep">·</span>
+      <a href="#" id="resetApiKey">Reset API key</a>
+    </div>
+  </section>
+
+  <script src="../lib/countries.js" type="module"></script>
+  <script src="popup.js" type="module"></script>
+</body>
+</html>
