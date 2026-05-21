@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Pegasus Hunter",
   "short_name": "Pegasus",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Scansiona Facebook Ads Library con overlay live e traccia prodotti vincenti su Shopify.",
   "permissions": [
     "storage",
@@ -39,7 +39,7 @@
   "content_scripts": [
     {
       "matches": ["https://www.facebook.com/ads/library/*"],
-      "js": ["content-scripts/fb-ads-extract.js"],
+      "js": ["lib/i18n.js", "content-scripts/fb-ads-extract.js"],
       "run_at": "document_idle"
     }
   ],

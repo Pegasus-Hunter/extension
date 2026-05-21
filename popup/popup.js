@@ -1,8 +1,15 @@
 // Popup UI logic. Niente framework — vanilla JS + chrome.storage + sendMessage
 // al service worker.
+//
+// i18n: globalThis.PegasusI18n.t(key, replacements) — caricato da lib/i18n.js
+// PRIMA di questo modulo (vedi popup.html). Default locale: IT (mercato primario),
+// EN per tutto il resto.
 
 import { storage } from "../lib/storage.js";
 import { COUNTRIES } from "../lib/countries.js";
+
+const i18n = globalThis.PegasusI18n;
+const t = (key, repl) => i18n.t(key, repl);
 
 const els = {
   viewSetup: document.getElementById("viewSetup"),
@@ -34,6 +41,9 @@ const els = {
 
 // === init ===
 async function init() {
+  // Bootstrap i18n: popola tutti i nodi [data-i18n] prima di mostrare la view.
+  // Manifest V3-safe: applyToDom usa textContent, mai innerHTML.
+  i18n.applyToDom(document);
   populateCountries();
   const apiKey = await storage.getApiKey();
   if (!apiKey) {
@@ -101,14 +111,17 @@ function renderState(state) {
   els.scanStatus.hidden = state.status === "idle";
 
   if (isRunning) {
-    setStatus("running", state.status === "scanning" ? "Scansionando" : "Avviando…");
+    setStatus(
+      "running",
+      state.status === "scanning" ? t("popup.status.scanning") : t("popup.status.starting"),
+    );
   } else if (state.status === "completed") {
-    setStatus("ok", "Completata");
+    setStatus("ok", t("popup.status.completed"));
   } else if (state.status === "error") {
-    setStatus("err", "Errore");
+    setStatus("err", t("popup.status.error"));
     if (state.lastError) pushLog("err", state.lastError);
   } else {
-    setStatus("", "In attesa");
+    setStatus("", t("popup.status.idle"));
   }
 }
 
@@ -127,7 +140,7 @@ els.btnSaveApiKey.addEventListener("click", async () => {
   const raw = els.apiKeyInput.value.trim();
   const server = els.serverSelect.value;
   if (!raw || !raw.startsWith("wsk_")) {
-    els.setupError.textContent = "API key non valida: deve iniziare con wsk_";
+    els.setupError.textContent = t("popup.err.keyInvalid");
     els.setupError.hidden = false;
     return;
   }
@@ -137,8 +150,7 @@ els.btnSaveApiKey.addEventListener("click", async () => {
     // Verifica chiave contro il server
     const pingRes = await chrome.runtime.sendMessage({ type: "PEGASUS_POPUP_PING_API" });
     if (!pingRes?.ok) {
-      els.setupError.textContent =
-        pingRes?.error || "Impossibile verificare la chiave col server";
+      els.setupError.textContent = pingRes?.error || t("popup.err.serverUnreach");
       els.setupError.hidden = false;
       await storage.clearApiKey();
       return;
@@ -175,7 +187,7 @@ els.openDashboard.addEventListener("click", async (e) => {
 
 els.resetApiKey.addEventListener("click", async (e) => {
   e.preventDefault();
-  if (!confirm("Vuoi davvero rimuovere la API key?")) return;
+  if (!confirm(t("popup.confirm.resetKey"))) return;
   await storage.clearApiKey();
   showSetup();
 });
@@ -186,25 +198,25 @@ els.btnStart.addEventListener("click", async () => {
   const limit = Number(els.limitSelect.value);
 
   if (!keyword) {
-    pushLog("err", "Inserisci una keyword");
+    pushLog("err", t("popup.err.keyMissing"));
     return;
   }
   await storage.setPrefs({ keyword, country, limit });
   els.scanLog.innerHTML = "";
-  pushLog("", `Avvio scansione: "${keyword}" — paese ${country}`);
+  pushLog("", t("popup.log.startScan", { kw: keyword, country }));
 
   const res = await chrome.runtime.sendMessage({
     type: "PEGASUS_POPUP_START",
     payload: { keyword, country, limit },
   });
   if (!res?.ok) {
-    pushLog("err", res?.error ?? "Avvio fallito");
+    pushLog("err", res?.error ?? t("popup.err.startFailed"));
   }
 });
 
 els.btnStop.addEventListener("click", async () => {
   await chrome.runtime.sendMessage({ type: "PEGASUS_POPUP_STOP" });
-  pushLog("", "Stop richiesto");
+  pushLog("", t("popup.log.stopRequested"));
 });
 
 // Ascolta stati push dal service worker

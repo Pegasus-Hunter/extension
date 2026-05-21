@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Pegasus Hunter</title>
+  <title data-i18n="popup.title">Pegasus Hunter</title>
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
@@ -14,84 +14,87 @@
     </div>
     <div class="status-pill" id="statusPill">
       <span class="status-dot" id="statusDot"></span>
-      <span id="statusLabel">In attesa</span>
+      <span id="statusLabel" data-i18n="popup.status.idle">In attesa</span>
     </div>
   </header>
 
   <!-- Setup view (visible if no API key) -->
   <section class="view" id="viewSetup" hidden>
-    <h2 class="view-title">Collega Pegasus Hunter</h2>
+    <h2 class="view-title" data-i18n="popup.setupTitle">Collega Pegasus Hunter</h2>
     <p class="view-help">
-      Incolla la tua API key. La trovi in
-      <a href="#" id="openApiKeysLink">pegasushunter.com → API Keys</a>.
+      <span id="setupHelpText" data-i18n="popup.setupHelp">Incolla la tua API key. La trovi in</span>
+      <a href="#" id="openApiKeysLink" data-i18n="popup.setupHelpLink">pegasushunter.com → API Keys</a>.
     </p>
     <label class="field">
-      <span class="field-label">API Key</span>
+      <span class="field-label" data-i18n="popup.apiKeyLabel">API Key</span>
       <input type="password" id="apiKeyInput" placeholder="wsk_..." spellcheck="false" autocomplete="off" />
     </label>
     <label class="field">
-      <span class="field-label">Server (avanzato)</span>
+      <span class="field-label" data-i18n="popup.serverLabel">Server (avanzato)</span>
       <select id="serverSelect">
-        <option value="https://api.pegasushunter.com">Produzione · api.pegasushunter.com</option>
-        <option value="http://localhost:8080">Locale · localhost:8080 (dev)</option>
+        <option value="https://api.pegasushunter.com" data-i18n="popup.serverProd">Produzione · api.pegasushunter.com</option>
+        <option value="http://localhost:8080" data-i18n="popup.serverLocal">Locale · localhost:8080 (dev)</option>
       </select>
     </label>
-    <button class="btn-primary" id="btnSaveApiKey">Salva e continua</button>
+    <button class="btn-primary" id="btnSaveApiKey" data-i18n="popup.saveContinue">Salva e continua</button>
     <div class="err" id="setupError" hidden></div>
   </section>
 
   <!-- Main view -->
   <section class="view" id="viewMain" hidden>
     <label class="field">
-      <span class="field-label">Keyword</span>
-      <input type="text" id="keywordInput" placeholder="es. perruque, integratore, smartwatch..." autocomplete="off" />
+      <span class="field-label" data-i18n="popup.keywordLabel">Keyword</span>
+      <input type="text" id="keywordInput" data-i18n="popup.keywordPh" data-i18n-attr="placeholder" placeholder="es. perruque, integratore, smartwatch..." autocomplete="off" />
     </label>
 
     <label class="field">
-      <span class="field-label">Paese</span>
+      <span class="field-label" data-i18n="popup.countryLabel">Paese</span>
       <select id="countrySelect"></select>
     </label>
 
     <label class="field">
-      <span class="field-label">Limite annunci</span>
+      <span class="field-label" data-i18n="popup.limitLabel">Limite annunci</span>
       <select id="limitSelect">
-        <option value="50">50 (veloce)</option>
-        <option value="150" selected>150 (medio)</option>
-        <option value="400">400 (lungo)</option>
-        <option value="0">Tutti (sperimentale)</option>
+        <option value="50" data-i18n="popup.limitFast">50 (veloce)</option>
+        <option value="150" selected data-i18n="popup.limitMedium">150 (medio)</option>
+        <option value="400" data-i18n="popup.limitLong">400 (lungo)</option>
+        <option value="0" data-i18n="popup.limitUnlimited">Tutti (sperimentale)</option>
       </select>
     </label>
 
     <div class="btn-row">
-      <button class="btn-primary" id="btnStart">Avvia scansione</button>
-      <button class="btn-ghost" id="btnStop" hidden>Ferma</button>
+      <button class="btn-primary" id="btnStart" data-i18n="popup.startScan">Avvia scansione</button>
+      <button class="btn-ghost" id="btnStop" hidden data-i18n="popup.stop">Ferma</button>
     </div>
 
     <div class="scan-status" id="scanStatus" hidden>
       <div class="metrics">
         <div class="metric">
           <div class="metric-num" id="metricAds">0</div>
-          <div class="metric-lbl">Annunci</div>
+          <div class="metric-lbl" data-i18n="popup.metricAds">Annunci</div>
         </div>
         <div class="metric">
           <div class="metric-num" id="metricStores">0</div>
-          <div class="metric-lbl">Shop trovati</div>
+          <div class="metric-lbl" data-i18n="popup.metricStores">Shop trovati</div>
         </div>
         <div class="metric">
           <div class="metric-num" id="metricSent">0</div>
-          <div class="metric-lbl">Sincronizzati</div>
+          <div class="metric-lbl" data-i18n="popup.metricSent">Sincronizzati</div>
         </div>
       </div>
       <div class="log" id="scanLog"></div>
     </div>
 
     <div class="footer-links">
-      <a href="#" id="openDashboard">Apri dashboard</a>
+      <a href="#" id="openDashboard" data-i18n="popup.openDashboard">Apri dashboard</a>
       <span class="dot-sep">·</span>
-      <a href="#" id="resetApiKey">Reset API key</a>
+      <a href="#" id="resetApiKey" data-i18n="popup.resetKey">Reset API key</a>
     </div>
   </section>
 
+  <!-- i18n bootstrap: classic script (non-module) so it attaches to globalThis
+       PRIMA del popup.js modulare. Required by CSP/MV3 — niente inline. -->
+  <script src="../lib/i18n.js"></script>
   <script src="../lib/countries.js" type="module"></script>
   <script src="popup.js" type="module"></script>
 </body>
