@@ -1,0 +1,77 @@
+name: Release extension .zip
+
+# Triggered when a new tag like v0.5.0 is pushed. Zips the extension folder
+# (excluding .git, .github, README, docs) and attaches the .zip to a
+# GitHub Release with the tag name. Provides both a versioned filename
+# (pegasus-extension-v0.5.0.zip) AND an evergreen filename
+# (pegasus-extension.zip) so the public /downloads page link doesn't
+# rot between releases.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Allow the default GITHUB_TOKEN to create releases + upload assets.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build .zip + attach to release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from manifest.json
+        id: manifest
+        run: |
+          version=$(jq -r '.version' manifest.json)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          tag="${GITHUB_REF_NAME}"
+          # Sanity check: tag matches manifest version. Refuse to release
+          # on mismatch so a stale tag doesn't ship the wrong .zip.
+          if [ "$tag" != "v$version" ] && [ "$tag" != "$version" ]; then
+            echo "::error::Tag $tag does not match manifest version $version"
+            exit 1
+          fi
+          echo "Building extension v$version for tag $tag"
+
+      - name: Build the .zip
+        run: |
+          # Stage a clean copy without .git / .github / docs noise.
+          mkdir -p dist
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='dist' \
+            --exclude='*.md' \
+            --exclude='node_modules' \
+            ./ dist/pegasus-extension/
+          # Versioned filename so users can pin a specific release.
+          (cd dist && zip -r "pegasus-extension-v${{ steps.manifest.outputs.version }}.zip" pegasus-extension)
+          # Evergreen filename so the /downloads link points at "latest".
+          cp "dist/pegasus-extension-v${{ steps.manifest.outputs.version }}.zip" \
+             "dist/pegasus-extension.zip"
+          ls -lh dist/
+
+      - name: Create release + upload .zip
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Pegasus Hunter Extension v${{ steps.manifest.outputs.version }}
+          body: |
+            Pegasus Hunter Chrome Extension v${{ steps.manifest.outputs.version }}.
+
+            Install in 4 steps:
+            1. Download `pegasus-extension-v${{ steps.manifest.outputs.version }}.zip`
+            2. Unzip to a permanent folder
+            3. Open `chrome://extensions`, enable Developer mode, click "Load unpacked"
+            4. Select the unzipped folder, paste your `wsk_…` API key in the popup
+
+            See https://pegasushunter.com/docs/extension for the full guide.
+          files: |
+            dist/pegasus-extension-v${{ steps.manifest.outputs.version }}.zip
+            dist/pegasus-extension.zip
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
