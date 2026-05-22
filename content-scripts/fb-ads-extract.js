@@ -1,21 +1,19 @@
 // Content script — gira dentro facebook.com/ads/library/* per scrappare i risultati.
 // Comunica solo via chrome.runtime.onMessage con il service worker.
 //
-// v0.7.0 "Steroids Edition" — riscrittura del main loop per:
-//   - IntersectionObserver-based card detection (no DOM polling)
-//   - Adaptive scroll pacing in funzione del rendimento
-//   - Multi-strategy keep-alive (audio → WebRTC → WakeLock)
-//   - Auto-resume da scan crashati (chrome.storage.local + handshake con SW)
-//   - Parallel batch flush (semaforo 3) con retry esponenziale
-//   - Queue mode quando la rete è down (accumulo, no flush)
-//   - Anti-detection scroll variability + random idle micro-pauses
-//   - Triplo fallback selector per `findAdCards`
-//   - Telemetria interna (metrics) inviata al SW al `PEGASUS_DONE`
-//   - Extract 12+ campi per card (video, CTA, headline, libraryId, platforms…)
-//   - Filtro URL esteso a Shopify/Woo/BigCommerce/Wix/Squarespace/ClickFunnels
+// Approccio:
+//  1) Aspetta che la pagina sia idle e che la lista risultati sia montata.
+//  2) Estrae tutti i link CTA degli ad (sono dietro lm.facebook.com/l.php redirect).
+//  3) Decodifica i redirect → URL reale del prodotto.
+//  4) Filtra per URL che hanno /products/ (Shopify pattern).
+//  5) Scrolla la finestra per caricare il batch successivo, con jitter.
+//  6) Manda batch al service worker ogni N nuovi item o ogni T secondi.
+//  7) Si ferma quando: hit del limite, scroll non aggiunge più nuovi item per 3 cicli,
+//     o ricevuto messaggio STOP.
 //
 // Robustness: Facebook obfusca aria-label / class names. Usiamo selettori
-// strutturali a fallback in cascata + pattern URL (l.php, /ads/library/?id=).
+// strutturali (link `[href]` dentro card `[role="article"]` o pattern noti)
+// + fallback su pattern URL (l.php, /l.php, /ads/library/?id=).
 
 (function () {
   "use strict";
@@ -44,40 +42,17 @@
     abortReason: null,
     cycles: 0,
     startedAt: Date.now(),
-    // v0.7.0 — sliding window per Speed (ads/min)
-    foundTimestamps: [], // ms epoch di ogni ad trovato (max 500)
-    // v0.7.0 — queue mode (network-down): accumula senza flushare
-    queueMode: false,
-    consecutiveNetworkFails: 0,
-    // v0.7.0 — pacing adattivo
-    adsPerCycleWindow: [], // ultimi 3 cicli (nuovi ad trovati)
-    currentCycleMs: 4000, // valore corrente di SCROLL_CYCLE_MS (mutable)
-    // v0.7.0 — telemetria interna
-    metrics: {
-      cycles: 0,
-      cardsPerCycle: [],
-      flushAttempts: 0,
-      flushSuccesses: 0,
-      flushFailures: 0,
-      recoveryKicks: 0,
-      stagnationStreak: 0,
-      keepAliveStrategy: "none",
-      startedAt: Date.now(),
-      endedAt: null,
-    },
   };
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // CONSTANTS — TUNED IN v0.7.0
-  // ═══════════════════════════════════════════════════════════════════════════
   const BATCH_FLUSH_SIZE = 25;
   const BATCH_FLUSH_MS = 10_000;
   // Pacing tra cicli (con jitter ±30%). Più lento = meno rischio di flag FB
-  // ma scansione più lunga. v0.7.0: BASE 4s, modulato in adaptive pacing.
-  const SCROLL_CYCLE_MS_BASE = 4000;
-  const SCROLL_CYCLE_MS_MIN = 1500;
-  const SCROLL_CYCLE_MS_MAX = 12_000;
+  // ma scansione più lunga. Aumentato per dare a FB tempo di rispondere.
+  const SCROLL_CYCLE_MS = 4000;
   // Cicli consecutivi senza nuovi annunci PRIMA di dichiarare la scansione finita.
+  // Con MAX_WAIT_NEW_CONTENT_MS=8s e SCROLL_CYCLE_MS=4s → ~20 cicli = ~4 min
+  // di pazienza prima di mollare. FB Ads Library può avere pause di 30-60s
+  // tra batch quando ne ha caricati molti.
   const STAGNATION_MAX_CYCLES = 25;
   // Dopo lo scroll-to-bottom, quanto aspettare per vedere nuove card prima
   // di considerare il ciclo "vuoto". Polling ogni 500ms.
@@ -85,158 +60,58 @@
   // Recovery: ogni RECOVERY_EVERY_CYCLES cicli senza crescita, faccio
   // scroll-up + scroll-down per "svegliare" il lazy-load di Facebook.
   const RECOVERY_EVERY_CYCLES = 4;
-
-  // v0.7.0 — parallel flush. Massimo 3 batch in volo verso il backend
-  // contemporaneamente. Promise.all + semaforo manuale (niente lib esterne).
-  const MAX_PARALLEL_FLUSHES = 3;
-  let inFlightFlushes = 0;
-
-  // v0.7.0 — DOM micro-cache: ricicla findAdCards() per N ms se chiamato
-  // ravvicinato (es. due volte nello stesso tick per observer + manuale).
-  const CARDS_CACHE_TTL_MS = 500;
-  let cardsCache = { ts: 0, value: [] };
-
-  // v0.7.0 — retry esponenziale per il flush. 3 tentativi: 1s, 3s, 9s con
-  // jitter ±30%. NON ritenta su 401/403/422.
-  const FLUSH_RETRY_DELAYS_MS = [1000, 3000, 9000];
-
-  // v0.7.0 — auto-resume: uno scan persistito è considerato "fresh" entro
-  // 5 minuti dal suo ultimo timestamp.
-  const RESUME_MAX_AGE_MS = 5 * 60 * 1000;
-
-  // v0.7.0 — speed window: 60s rolling per "ads/min".
-  const SPEED_WINDOW_MS = 60_000;
-
-  // v0.7.0 — network-down threshold: 3 fallimenti consecutivi network →
-  // queue mode (accumula senza flushare per 60s).
-  const NETWORK_FAIL_THRESHOLD = 3;
-  const QUEUE_MODE_RETRY_MS = 60_000;
-
   let flushTimer = null;
-  let queueModeTimer = null;
-  let cardObserver = null;       // v0.7.0 — IntersectionObserver
-  let observedCards = new WeakSet(); // dedupe card già osservate
-  let keepAliveHandle = null;    // legacy (audio); ora dentro keepAlive.audio
-  const keepAlive = {            // v0.7.0 — multi-strategy holder
-    audio: null,
-    webrtc: null,
-    wakeLock: null,
-    strategy: "none",
-  };
+  let keepAliveHandle = null;
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // KEEP-ALIVE (v0.6.0 → v0.7.0 multi-strategy)
+  // KEEP-ALIVE (v0.6.0) — anti-throttling background scraping
   //
   // Chrome aggressively throttles setTimeout/setInterval/RAF on non-visible
-  // tabs. Bypassiamo con: audio → WebRTC → WakeLock, in cascata. Il primo
-  // che riesce diventa la `keepAlive.strategy` attiva (log + overlay badge).
+  // tabs: a 4 s loop becomes >30 s, virtualized lists like FB Ads Library
+  // stop fetching new pages. A tab that's playing media is exempt from this
+  // throttling. We exploit it by running an inaudible OscillatorNode through
+  // a near-zero gain — Chrome flags the tab as "media-playing" and keeps it
+  // at full speed even minimized.
+  //
+  // The user sees a small audio indicator on the tab icon. Trade-off
+  // accepted: the alternative is "scrape stops the moment you switch tab".
   // ═══════════════════════════════════════════════════════════════════════════
 
-  // [1] AudioContext con OscillatorNode a gain ≈ -80 dB. Chrome marca la tab
-  //     come "media-playing" e la esclude dal throttling. Funziona quasi sempre
-  //     se la pagina ha avuto un user gesture (il click START sul popup conta).
-  function tryAudioKeepAlive() {
+  function startKeepAlive() {
+    if (keepAliveHandle) return;
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) throw new Error("AudioContext unavailable");
+      if (!AC) {
+        logErr(t("cs.log.keepAliveFail", { err: "AudioContext unavailable" }));
+        return;
+      }
       const ctx = new AC();
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
+      // 0.0001 ≈ -80 dB — below the audible floor on every consumer device,
+      // but non-zero so Chrome counts the tab as actively producing audio.
       gain.gain.value = 0.0001;
       osc.frequency.value = 440;
       osc.connect(gain).connect(ctx.destination);
       osc.start();
-      if (ctx.state === "suspended") ctx.resume().catch(() => {});
-      keepAlive.audio = { ctx, osc };
-      keepAliveHandle = keepAlive.audio; // back-compat ref usato da visibility handler
-      keepAlive.strategy = "audio";
-      STATE.metrics.keepAliveStrategy = "audio";
+      keepAliveHandle = { ctx, osc };
+      // AudioContext may start in "suspended" state under autoplay policy
+      // if no user gesture was captured. The popup click that triggered
+      // PEGASUS_START usually counts; if not, we resume on visibilitychange.
+      if (ctx.state === "suspended") {
+        ctx.resume().catch(() => {});
+      }
       log(t("cs.log.keepAliveOn"));
-      return true;
     } catch (e) {
       logErr(t("cs.log.keepAliveFail", { err: e?.message ?? e }));
-      return false;
     }
-  }
-
-  // [2] WebRTC fallback. Una RTCPeerConnection con un data channel aperto
-  //     mantiene attiva la tab in alcuni Chromium fork che bloccano
-  //     AudioContext senza user gesture (es. Brave/Vivaldi con privacy preset).
-  //     Niente connessione esterna: il PC resta in "new" perché non facciamo
-  //     setLocalDescription contro un peer, ma il channel open basta a Chrome.
-  function tryWebRTCKeepAlive() {
-    try {
-      if (typeof RTCPeerConnection === "undefined") {
-        throw new Error("RTCPeerConnection unavailable");
-      }
-      const pc = new RTCPeerConnection();
-      const dc = pc.createDataChannel("pegasus-keepalive");
-      // Forziamo offer/answer locale per attivare il channel internamente:
-      // anche senza peer remoto, Chrome conta la connessione come "in uso"
-      // e riduce il throttling.
-      pc.createOffer()
-        .then((offer) => pc.setLocalDescription(offer))
-        .catch(() => {});
-      keepAlive.webrtc = { pc, dc };
-      keepAlive.strategy = "webrtc";
-      STATE.metrics.keepAliveStrategy = "webrtc";
-      log(t("cs.log.keepAliveWebRTC"));
-      return true;
-    } catch (e) {
-      logErr(t("cs.log.keepAliveFail", { err: `WebRTC: ${e?.message ?? e}` }));
-      return false;
-    }
-  }
-
-  // [3] Wake Lock API. Richiede HTTPS + document visibile per ottenerlo.
-  //     Non sempre disponibile (Firefox no, Safari no, alcuni Chromium fork
-  //     no). Quando c'è, è il sistema più "pulito" — niente media indicator
-  //     sulla tab — ma funziona SOLO con tab visibile. Bonus, non sostituto.
-  async function tryWakeLockKeepAlive() {
-    try {
-      if (!navigator.wakeLock) throw new Error("WakeLock API missing");
-      const wl = await navigator.wakeLock.request("screen");
-      keepAlive.wakeLock = wl;
-      // Se non abbiamo niente di meglio, segnalo come strategy attiva.
-      // Altrimenti audio/webrtc tengono il primato (funzionano anche minimizzati).
-      if (keepAlive.strategy === "none") {
-        keepAlive.strategy = "wakelock";
-        STATE.metrics.keepAliveStrategy = "wakelock";
-      }
-      log(t("cs.log.keepAliveWakeLock"));
-      return true;
-    } catch (e) {
-      // Silent: WakeLock è bonus, non blocking.
-      return false;
-    }
-  }
-
-  async function startKeepAlive() {
-    // Tentativi in cascata: il primo che riesce diventa primary strategy.
-    // Wake Lock è sempre bonus se disponibile, non sostituisce audio/webrtc.
-    const audioOk = tryAudioKeepAlive();
-    if (!audioOk) tryWebRTCKeepAlive();
-    // Wake lock parallelo, best-effort, async.
-    tryWakeLockKeepAlive().catch(() => {});
   }
 
   function stopKeepAlive() {
-    if (keepAlive.audio) {
-      try { keepAlive.audio.osc.stop(); } catch {}
-      try { keepAlive.audio.ctx.close(); } catch {}
-      keepAlive.audio = null;
-    }
-    if (keepAlive.webrtc) {
-      try { keepAlive.webrtc.dc.close(); } catch {}
-      try { keepAlive.webrtc.pc.close(); } catch {}
-      keepAlive.webrtc = null;
-    }
-    if (keepAlive.wakeLock) {
-      try { keepAlive.wakeLock.release(); } catch {}
-      keepAlive.wakeLock = null;
-    }
+    if (!keepAliveHandle) return;
+    try { keepAliveHandle.osc.stop(); } catch {}
+    try { keepAliveHandle.ctx.close(); } catch {}
     keepAliveHandle = null;
-    keepAlive.strategy = "none";
   }
 
   function log(...args) {
@@ -258,7 +133,12 @@
 
   // ═══════════════════════════════════════════════════════════════════════════
   // OVERLAY LIVE — la killer UX feature di Pegasus Hunter v0.2.0.
-  // v0.7.0 — aggiunte: speed, keepalive badge, queue mode banner, resume btn.
+  //
+  // Mostra in alto a destra della pagina FB Ads Library un widget fisso
+  // con contatori che salgono in tempo reale durante lo scraping. L'utente
+  // VEDE cosa sta facendo l'estensione, niente magia nascosta.
+  //
+  // Vantaggi: trust, educazione, demo marketing-ready, niente FB detection.
   // ═══════════════════════════════════════════════════════════════════════════
 
   let overlayEl = null;
@@ -328,32 +208,6 @@
           font-size: 9px; color: #64748b;
           text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px;
         }
-        .ph-speed-row {
-          display: flex; align-items: center; justify-content: space-between;
-          padding: 4px 2px 8px; font-size: 11px; color: #94a3b8;
-        }
-        .ph-speed-row strong {
-          color: #f59e0b; font-weight: 700;
-          font-variant-numeric: tabular-nums;
-        }
-        .ph-ka-badge {
-          display: inline-flex; align-items: center; gap: 4px;
-          padding: 2px 6px; border-radius: 4px;
-          font-size: 10px; background: rgba(34,197,94,0.15);
-          color: #4ade80; border: 1px solid rgba(34,197,94,0.3);
-        }
-        .ph-ka-badge.none {
-          background: rgba(100,116,139,0.15);
-          color: #94a3b8; border-color: rgba(100,116,139,0.3);
-        }
-        .ph-queue-banner {
-          margin: 4px 0 8px; padding: 6px 8px;
-          background: rgba(245,158,11,0.12);
-          border: 1px solid rgba(245,158,11,0.35);
-          border-radius: 6px;
-          color: #fbbf24; font-size: 11px;
-        }
-        .ph-queue-banner[hidden] { display: none; }
         .ph-actions { display: flex; gap: 6px; }
         .ph-btn {
           flex: 1; padding: 7px 10px; border-radius: 6px;
@@ -388,11 +242,6 @@
           <div class="ph-cell"><div class="ph-num" id="ph-stores">0</div><div class="ph-lbl">${t("overlay.metricStores")}</div></div>
           <div class="ph-cell"><div class="ph-num" id="ph-sent">0</div><div class="ph-lbl">${t("overlay.metricSent")}</div></div>
         </div>
-        <div class="ph-speed-row">
-          <span>${t("overlay.speedLabel")}: <strong id="ph-speed">0</strong> ${t("overlay.speedUnit")}</span>
-          <span class="ph-ka-badge none" id="ph-ka">${t("overlay.keepAliveNone")}</span>
-        </div>
-        <div class="ph-queue-banner" id="ph-queue" hidden></div>
         <div class="ph-actions">
           <button class="ph-btn danger" id="ph-stop">${t("overlay.btnStop")}</button>
           <button class="ph-btn primary" id="ph-open">${t("overlay.btnDashboard")}</button>
@@ -426,38 +275,6 @@
     if (typeof sent === "number") s.getElementById("ph-sent").textContent = String(sent);
   }
 
-  function updateOverlaySpeed() {
-    if (!overlayEl) return;
-    const speed = computeSpeed();
-    overlayEl.shadow.getElementById("ph-speed").textContent = String(speed);
-  }
-
-  function updateOverlayKeepAlive() {
-    if (!overlayEl) return;
-    const el = overlayEl.shadow.getElementById("ph-ka");
-    if (!el) return;
-    const s = keepAlive.strategy;
-    let label = t("overlay.keepAliveNone");
-    let cls = "ph-ka-badge none";
-    if (s === "audio") { label = t("overlay.keepAliveAudio"); cls = "ph-ka-badge"; }
-    else if (s === "webrtc") { label = t("overlay.keepAliveWebRTC"); cls = "ph-ka-badge"; }
-    else if (s === "wakelock") { label = t("overlay.keepAliveWakeLock"); cls = "ph-ka-badge"; }
-    el.textContent = label;
-    el.className = cls;
-  }
-
-  function updateOverlayQueueMode() {
-    if (!overlayEl) return;
-    const banner = overlayEl.shadow.getElementById("ph-queue");
-    if (!banner) return;
-    if (STATE.queueMode) {
-      banner.textContent = t("overlay.queueMode", { n: STATE.batch.length });
-      banner.hidden = false;
-    } else {
-      banner.hidden = true;
-    }
-  }
-
   function updateOverlayStatus(text, variant) {
     if (!overlayEl) return;
     const s = overlayEl.shadow;
@@ -476,10 +293,6 @@
     }
     overlayEl = null;
   }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // URL handling — unwrap FB redirects, normalize, platform detection.
-  // ═══════════════════════════════════════════════════════════════════════════
 
   // Decodifica i redirect di Facebook: lm.facebook.com/l.php?u=ENCODED_URL&...
   // oppure /l.php?u=ENCODED_URL&... in href relativi.
@@ -511,60 +324,13 @@
     }
   }
 
-  // v0.7.0 — platform detection. Ritorna lo "slug" piattaforma del prodotto:
-  // shopify | woocommerce | bigcommerce | wix | squarespace | clickfunnels |
-  // unknown. Usato sia per il filtro che inviato al backend per analytics.
-  function detectPlatform(url) {
-    if (!url) return "unknown";
-    try {
-      const u = new URL(url);
-      const host = u.hostname.toLowerCase();
-      const path = u.pathname;
-
-      // Hostname-based first (più affidabile quando esplicito).
-      if (host.endsWith(".myshopify.com")) return "shopify";
-      if (host.endsWith(".bigcommerce.com")) return "bigcommerce";
-      if (host.endsWith(".wixsite.com") || host.endsWith(".wix.com")) return "wix";
-      if (host.endsWith(".squarespace.com")) return "squarespace";
-      if (host.endsWith(".clickfunnels.com") || host.endsWith(".myclickfunnels.com")) return "clickfunnels";
-
-      // Path-based fallback: il dominio è custom (e.g. brand.com) ma il path
-      // tradisce la piattaforma. Ordine matters: pattern più specifici prima.
-      if (/^\/product-page\/[^/]+/i.test(path)) return "wix";
-      if (/^\/products\/[^/]+/i.test(path)) return "shopify"; // Shopify default path
-      if (/^\/product\/[^/]+\/?$/i.test(path)) return "woocommerce";
-      if (/^\/(shop|store)\/[^/]+/i.test(path)) return "squarespace";
-      if (/^\/(checkout|offer|order)\/[^/]+/i.test(path)) return "clickfunnels";
-
-      return "unknown";
-    } catch {
-      return "unknown";
-    }
-  }
-
-  // v0.7.0 — espansione di isShopifyProductUrl. Match qualsiasi URL "trackable"
-  // su una delle piattaforme supportate. Niente falsi positivi su marketplace
-  // (amazon/ebay/etc.).
-  function isTrackableProductUrl(url) {
+  function isShopifyProductUrl(url) {
     if (!url || typeof url !== "string") return false;
     if (!/^https?:\/\//i.test(url)) return false;
-
-    // Esclude marketplace e affiliate finti positivi.
-    if (/(amazon|ebay|aliexpress|temu|walmart|etsy|alibaba|wish\.com)\./i.test(url)) {
-      return false;
-    }
-
-    const platform = detectPlatform(url);
-    if (platform !== "unknown") return true;
-
-    // Generic patterns: qualsiasi URL con `/buy/` `/order/` `/checkout/`
-    // a path, anche su domini custom che non rientrano nei pattern noti.
-    try {
-      const path = new URL(url).pathname;
-      if (/\/(buy|order|checkout)\/[^/]+/i.test(path)) return true;
-    } catch {}
-
-    return false;
+    if (!/\/products\//i.test(url)) return false;
+    // Esclude domini noti non-Shopify finti positivi
+    if (/(amazon|ebay|aliexpress|temu|walmart)\./i.test(url)) return false;
+    return true;
   }
 
   function normalizeProductUrl(url) {
@@ -597,125 +363,23 @@
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // EXTRACT CARD INFO — v0.7.0 expanded to 12+ fields
-  //
-  // Best-effort extraction: ogni campo è nullable. Facebook cambia DOM ogni
-  // 2-3 mesi quindi NON ci basiamo su class names. Pattern stabili usati:
-  //   - aria-label per Library ID
-  //   - testo regex multilingua per "started running" + "X ads"
-  //   - <video>/<img> per media
-  //   - <a href> per advertiser_url
-  //   - heuristic CTA: <span>/<div> con testo corto inside <a target=_blank>
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  // Mappa multilingua "started running on …" → estrae la data come testo grezzo.
-  // FB localizza il prefisso ma la data è sempre alfa+num quindi ce la teniamo
-  // così com'è e la mandiamo al backend (parsing lato server più robusto).
-  const START_DATE_PATTERNS = [
-    /Avviato il\s+([0-9]{1,2}\s+\w+\s+\d{4})/i,           // IT
-    /Avviato\s+il\s+([^·\n]+?)(?=$|·|\n)/i,                // IT relaxed
-    /Started running on\s+([^·\n]+?)(?=$|·|\n)/i,          // EN
-    /Sponsorisé(?:[esn]?)\s+depuis le\s+([^·\n]+?)(?=$|·|\n)/i, // FR
-    /En cours d'exécution depuis le\s+([^·\n]+?)(?=$|·|\n)/i,  // FR alt
-    /En ejecución desde el\s+([^·\n]+?)(?=$|·|\n)/i,       // ES
-    /Em exibição desde\s+([^·\n]+?)(?=$|·|\n)/i,           // PT
-    /In Auslieferung seit dem\s+([^·\n]+?)(?=$|·|\n)/i,    // DE
-    /Loopt sinds\s+([^·\n]+?)(?=$|·|\n)/i,                 // NL
-  ];
-
-  // CTA testi più comuni multilingua — usati per validare che un elemento
-  // testuale corto adiacente al link sia effettivamente la CTA, non rumore.
-  const CTA_HINTS = new Set([
-    // EN
-    "shop now", "buy now", "order now", "learn more", "sign up", "get offer",
-    "subscribe", "download", "get quote", "contact us", "apply now", "book now",
-    // IT
-    "acquista", "acquista ora", "scopri di più", "iscriviti", "ordina ora",
-    "ricevi offerta", "compra adesso", "scopri", "registrati",
-    // ES/PT
-    "comprar ahora", "más información", "regístrate", "comprar agora",
-    // FR
-    "acheter", "en savoir plus", "s'inscrire",
-    // DE
-    "jetzt kaufen", "mehr ansehen", "registrieren",
-    // NL
-    "nu winkelen", "meer informatie",
-  ]);
-
-  function isCtaText(s) {
-    if (!s) return false;
-    const norm = s.trim().toLowerCase();
-    if (norm.length === 0 || norm.length > 35) return false;
-    return CTA_HINTS.has(norm) || /^(shop|buy|order|learn|acquista|compra|comprar|acheter)/i.test(norm);
-  }
-
-  // Plataforme icons (Facebook/Instagram/etc.) sono SVG con aria-label
-  // localizzato. Cerchiamo la presenza del nome piattaforma nel testo della
-  // card / aria-label per popolare l'array.
-  const PLATFORM_KEYWORDS = {
-    facebook: ["facebook"],
-    instagram: ["instagram"],
-    messenger: ["messenger"],
-    audience_network: ["audience network", "audience"],
-  };
-
-  function detectAdPlatforms(card) {
-    const out = new Set();
-    try {
-      // Cerca tutti gli <svg> con title o aria-label dentro la card; sono le
-      // icone "Piattaforme: FB+IG+…" che FB mostra sotto "Avviato il …".
-      const labeled = card.querySelectorAll('[aria-label]');
-      for (const el of labeled) {
-        const lbl = (el.getAttribute("aria-label") || "").toLowerCase();
-        for (const [plat, kws] of Object.entries(PLATFORM_KEYWORDS)) {
-          if (kws.some((k) => lbl.includes(k))) out.add(plat);
-        }
-      }
-    } catch {}
-    return Array.from(out);
-  }
-
+  // Estrae info aggiuntive da una card ad: nome inserzionista, conteggio
+  // "X annunci attivi", immagine principale, se trovabili. Best-effort.
   function extractCardInfo(card) {
     let advertiser = null;
-    let advertiser_url = null;
     let imageUrl = null;
-    let videoUrl = null;
     let activeAds = null;
-    let adStartDate = null;
-    let libraryId = null;
-    let ctaText = null;
-    let headline = null;
-    let bodyText = null;
-    let displayDomain = null;
-    let platforms = [];
 
     try {
-      // Advertiser link: primo <a href="/PageName"> con testo non vuoto.
-      // Spesso ha role="link" ma alcuni varianti FB lo droppano — fallback al
-      // primo <a href^="/"> "pulito" (no /ads/, no /l.php, no /watch).
-      const advLink =
-        card.querySelector('a[role="link"][href^="/"]') ||
-        Array.from(card.querySelectorAll('a[href^="/"]')).find((a) => {
-          const h = a.getAttribute("href") || "";
-          return !/^\/(ads|l\.php|watch|reel|story|stories|policies|help)/i.test(h)
-            && a.textContent.trim().length > 0;
-        });
+      // Advertiser: spesso è il primo link a /<page-name> con testo non vuoto
+      const advLink = card.querySelector('a[role="link"][href^="/"]');
       if (advLink && advLink.textContent.trim()) {
         advertiser = advLink.textContent.trim().slice(0, 200);
-        const href = advLink.getAttribute("href") || advLink.href;
-        if (href) {
-          try {
-            advertiser_url = new URL(href, location.origin).toString();
-          } catch {
-            advertiser_url = href;
-          }
-        }
       }
     } catch {}
 
     try {
-      // Image: primo <img> abbastanza grande da essere una creative (non avatar).
+      // Immagine: il primo <img> dentro la card che non sia un avatar piccolo
       const imgs = card.querySelectorAll("img");
       for (const img of imgs) {
         const w = img.naturalWidth || parseInt(img.width, 10) || 0;
@@ -723,17 +387,6 @@
           imageUrl = img.src;
           break;
         }
-      }
-    } catch {}
-
-    try {
-      // Video: <video> con src diretto o <source>. FB usa blob URL che spesso
-      // sono inutili lato server; preferiamo poster/src "https://" se presente.
-      const video = card.querySelector("video");
-      if (video) {
-        const src = video.getAttribute("src") || video.src || null;
-        if (src && /^https?:/.test(src)) videoUrl = src;
-        else if (video.poster) videoUrl = video.poster; // fallback al poster
       }
     } catch {}
 
@@ -757,429 +410,90 @@
       }
     } catch {}
 
-    try {
-      // Start date: scanniamo il textContent della card cercando un prefisso noto.
-      const txt = card.textContent || "";
-      for (const p of START_DATE_PATTERNS) {
-        const m = txt.match(p);
-        if (m && m[1]) {
-          adStartDate = m[1].trim().slice(0, 100);
-          break;
-        }
-      }
-    } catch {}
-
-    try {
-      // Library ID: link a /ads/library/?id=NNNN o aria-label "Library ID: NNN".
-      // Pattern stabile da anni, FB non l'ha mai cambiato.
-      const libLink = card.querySelector('a[href*="/ads/library/?id="]');
-      if (libLink) {
-        const href = libLink.getAttribute("href") || libLink.href || "";
-        const m = href.match(/[?&]id=(\d+)/);
-        if (m) libraryId = m[1];
-      }
-      if (!libraryId) {
-        const txt = card.textContent || "";
-        const m = txt.match(/(?:Library ID|ID libreria|ID|Identifiant)[:\s]+(\d{10,})/i);
-        if (m) libraryId = m[1];
-      }
-    } catch {}
-
-    try {
-      // CTA text: cerchiamo dentro <a target="_blank"> (link CTA esterno) un
-      // <div>/<span> con testo corto. FB renderizza il bottone come stack di div.
-      const ctaLinks = card.querySelectorAll('a[target="_blank"]');
-      for (const a of ctaLinks) {
-        // Stack di div con un testo corto come ultimo nodo testuale.
-        const candidate = Array.from(a.querySelectorAll('div, span'))
-          .map((el) => el.textContent.trim())
-          .find((s) => isCtaText(s));
-        if (candidate) {
-          ctaText = candidate.slice(0, 50);
-          break;
-        }
-      }
-    } catch {}
-
-    try {
-      // Display domain: sotto la CTA c'è quasi sempre un link visible con il
-      // dominio del prodotto (es. "techweise.com"). Pattern: piccolo, in
-      // <a target=_blank> o testo subito sopra/sotto la CTA.
-      const ctaLinks = card.querySelectorAll('a[target="_blank"]');
-      for (const a of ctaLinks) {
-        const span = a.querySelector('span, div');
-        if (!span) continue;
-        // Visited each direct text descendant; if it's a domain-like token, use it.
-        const candidates = Array.from(a.querySelectorAll('div, span'))
-          .map((el) => el.textContent.trim().toLowerCase())
-          .filter((s) => /^[a-z0-9-]+(\.[a-z0-9-]+){1,}$/i.test(s) && !s.endsWith(".com.")); // bare-domain pattern
-        if (candidates.length > 0) {
-          displayDomain = candidates[0];
-          break;
-        }
-      }
-    } catch {}
-
-    try {
-      // Headline & bodyText: i div che contengono testo ad-copy sono spesso il
-      // primo blocco di testo "lungo" sopra il media. Heuristica: prendi i due
-      // <span>/<div> con dir="auto" più "informativi" (almeno 20 caratteri).
-      const textNodes = Array.from(card.querySelectorAll('[dir="auto"]'))
-        .map((el) => el.textContent.trim())
-        .filter((s) => s.length >= 20 && s.length <= 400);
-      // De-duplicate consecutive equal strings
-      const dedup = [];
-      for (const s of textNodes) {
-        if (dedup[dedup.length - 1] !== s) dedup.push(s);
-      }
-      if (dedup.length >= 1) bodyText = dedup[0].slice(0, 400);
-      if (dedup.length >= 2) headline = dedup[1].slice(0, 200);
-    } catch {}
-
-    try {
-      platforms = detectAdPlatforms(card);
-    } catch {}
-
-    return {
-      advertiser,
-      advertiser_url,
-      imageUrl,
-      videoUrl,
-      activeAds,
-      adStartDate,
-      libraryId,
-      ctaText,
-      headline,
-      bodyText,
-      displayDomain,
-      platforms,
-    };
+    return { advertiser, imageUrl, activeAds };
   }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // CARD FINDING — v0.7.0 triple-fallback + 500ms micro-cache
-  //
-  // FB cambia il DOM ogni qualche mese. Strategia con 3 fallback in cascata:
-  //   1) [role="article"] — il pattern più stabile e desiderato.
-  //   2) [role="main"] > div > div > div con >=3 figli — struttura grid.
-  //   3) <div> contenenti <a href*="l.php"> + <img> + testo "X ads".
-  // Logghiamo quale strategia ha trovato al primo successo del ciclo.
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  let lastWinningStrategy = null;
 
   function findAdCards() {
-    // Micro-cache: due chiamate ravvicinate nello stesso tick non rilanciano
-    // querySelectorAll (200ms+ di parse su pagine grandi). Sliding window 500ms.
-    const now = Date.now();
-    if (now - cardsCache.ts < CARDS_CACHE_TTL_MS && cardsCache.value.length > 0) {
-      return cardsCache.value;
-    }
-
     // Strategia 1: role=article (pattern stabile)
     let cards = Array.from(document.querySelectorAll('[role="article"]'));
-    let strategy = "role=article";
-
-    // Strategia 2: layout grid sotto [role="main"]. Pattern stabile da ~2 anni
-    // perché è il container del feed virtualizzato.
-    if (cards.length === 0) {
-      const main = document.querySelector('[role="main"]');
-      if (main) {
-        const candidates = Array.from(main.querySelectorAll(":scope > div > div > div"))
-          .filter((d) => d.children.length >= 3);
-        if (candidates.length > 0) {
-          cards = candidates;
-          strategy = "main-grid";
+    if (cards.length > 0) return cards;
+    // Strategia 2: fallback grezzo — div con link l.php dentro
+    const containers = new Set();
+    document.querySelectorAll('a[href*="l.php"], a[href*="lm.facebook.com"]').forEach((a) => {
+      let p = a;
+      for (let i = 0; i < 8 && p; i++) {
+        p = p.parentElement;
+        if (p && p.children.length >= 3) {
+          containers.add(p);
+          break;
         }
       }
-    }
-
-    // Strategia 3: brute-force pattern. Cerca div che contengono link l.php +
-    // img + testo "X ads/annunci/…". Lento ma quasi indistruttibile.
-    if (cards.length === 0) {
-      const containers = new Set();
-      document.querySelectorAll('a[href*="l.php"], a[href*="lm.facebook.com"]').forEach((a) => {
-        let p = a;
-        for (let i = 0; i < 8 && p; i++) {
-          p = p.parentElement;
-          if (!p) break;
-          if (p.children.length >= 3 && p.querySelector("img")) {
-            const txt = p.textContent || "";
-            if (/\d+\s+(ads?|annunci|annonces|anuncios|anzeigen|advertenties|anúncios)/i.test(txt)) {
-              containers.add(p);
-              break;
-            }
-          }
-        }
-      });
-      if (containers.size > 0) {
-        cards = Array.from(containers);
-        strategy = "brute-force";
-      }
-    }
-
-    // Logga solo quando la strategia "vincente" cambia: evita rumore in console.
-    if (cards.length > 0 && strategy !== lastWinningStrategy) {
-      log(t("cs.log.selectorWin", { strategy, n: cards.length }));
-      lastWinningStrategy = strategy;
-    }
-
-    cardsCache = { ts: now, value: cards };
-    return cards;
-  }
-
-  // v0.7.0 — extract from a single card (used by IntersectionObserver path).
-  // Ritorna 1 se nuovo ad aggiunto, 0 se duplicate/non valido.
-  function processCard(card) {
-    if (!card || observedCards.has(card)) return 0;
-    observedCards.add(card);
-
-    const links = card.querySelectorAll('a[href*="l.php"], a[href*="lm.facebook.com"], a[href^="http"]');
-    let added = 0;
-    for (const a of links) {
-      const unwrapped = unwrapFbRedirect(a.getAttribute("href") || a.href);
-      if (!unwrapped) continue;
-      if (!isTrackableProductUrl(unwrapped)) continue;
-      const norm = normalizeProductUrl(unwrapped);
-      if (STATE.seen.has(norm)) continue;
-      STATE.seen.add(norm);
-      const info = extractCardInfo(card);
-      STATE.batch.push({
-        pageUrl: norm,
-        platform: detectPlatform(norm),
-        advertiser: info.advertiser,
-        advertiser_url: info.advertiser_url,
-        imageUrl: info.imageUrl,
-        videoUrl: info.videoUrl,
-        activeAds: info.activeAds,
-        adStartDate: info.adStartDate,
-        libraryId: info.libraryId,
-        ctaText: info.ctaText,
-        headline: info.headline,
-        bodyText: info.bodyText,
-        displayDomain: info.displayDomain,
-        platforms: info.platforms,
-      });
-      STATE.totalFound++;
-      STATE.sinceLastBatch++;
-      STATE.foundTimestamps.push(Date.now());
-      // Cap the sliding window array — sono solo timestamp, 500 entries ~ 4KB.
-      if (STATE.foundTimestamps.length > 500) STATE.foundTimestamps.shift();
-      added++;
-      if (STATE.limit > 0 && STATE.totalFound >= STATE.limit) {
-        STATE.abortReason = "limit";
-        break;
-      }
-    }
-    return added;
+    });
+    return Array.from(containers);
   }
 
   function collectFromVisibleCards() {
     const cards = findAdCards();
     let added = 0;
     for (const card of cards) {
-      added += processCard(card);
+      const links = card.querySelectorAll('a[href*="l.php"], a[href*="lm.facebook.com"], a[href^="http"]');
+      for (const a of links) {
+        const unwrapped = unwrapFbRedirect(a.getAttribute("href") || a.href);
+        if (!unwrapped) continue;
+        if (!isShopifyProductUrl(unwrapped)) continue;
+        const norm = normalizeProductUrl(unwrapped);
+        if (STATE.seen.has(norm)) continue;
+        STATE.seen.add(norm);
+        const info = extractCardInfo(card);
+        STATE.batch.push({
+          pageUrl: norm,
+          advertiser: info.advertiser,
+          imageUrl: info.imageUrl,
+          activeAds: info.activeAds,
+        });
+        STATE.totalFound++;
+        STATE.sinceLastBatch++;
+        added++;
+        if (STATE.limit > 0 && STATE.totalFound >= STATE.limit) {
+          STATE.abortReason = "limit";
+          break;
+        }
+      }
       if (STATE.abortReason) break;
     }
     return added;
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // INTERSECTION OBSERVER — v0.7.0 real-time card detection
-  //
-  // Polling con findAdCards() ogni ciclo è O(N*M) dove N è il numero di card
-  // nel DOM (può salire a 1000+). IntersectionObserver è O(N) totale +
-  // notifiche immediate quando una card entra in viewport — il modo nativo
-  // di Chrome per dire "qualcosa è apparso".
-  //
-  // Strategia: appena la card entra in viewport, la processiamo. Pollin
-  // collectFromVisibleCards() resta come fallback al primo ciclo (per le
-  // card già presenti) + nei recovery kick.
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  function setupCardObserver() {
-    if (typeof IntersectionObserver === "undefined") {
-      logErr(t("cs.log.observerFail", { err: "IntersectionObserver not available" }));
-      return false;
-    }
-    if (cardObserver) return true; // già attivo
-
-    try {
-      cardObserver = new IntersectionObserver(
-        (entries) => {
-          if (!STATE.scanning) return;
-          for (const e of entries) {
-            if (e.isIntersecting) {
-              processCard(e.target);
-            }
-          }
-        },
-        // rootMargin "0px 0px 200px 0px" → trigghera anche quando la card è 200px
-        // sotto il viewport (FB la rende mentre stai per arrivarci).
-        { root: null, rootMargin: "0px 0px 200px 0px", threshold: 0.1 }
-      );
-      log(t("cs.log.observerOn"));
-      return true;
-    } catch (e) {
-      logErr(t("cs.log.observerFail", { err: e?.message ?? e }));
-      cardObserver = null;
-      return false;
-    }
-  }
-
-  // Attacca l'observer alle card attualmente nel DOM. Da chiamare dopo ogni
-  // scroll: le card nuove non sono nel WeakSet observedCards, l'observer le
-  // emette al primo intersection. Le card già processate (observedCards) le
-  // skippiamo silently — observe() su un nodo già osservato è no-op.
-  function attachObserverToNewCards() {
-    if (!cardObserver) return;
-    const cards = findAdCards();
-    for (const c of cards) {
-      try { cardObserver.observe(c); } catch {}
-    }
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // FLUSH BATCH — v0.7.0 parallel + retry esponenziale + queue mode
-  //
-  // - Max MAX_PARALLEL_FLUSHES batch in volo (semaforo manuale `inFlightFlushes`).
-  // - Retry 3 tentativi: 1s, 3s, 9s con jitter ±30%.
-  // - 401/403/422 → abort scan (auth_error o validation).
-  // - 3 fail consecutivi network → queueMode ON: niente flush per 60s.
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  function isAuthError(e) {
-    const s = Number(e?.status ?? NaN);
-    if (s === 401 || s === 403) return true;
-    return /401|403/.test(String(e?.message ?? ""));
-  }
-
-  function isValidationError(e) {
-    return Number(e?.status ?? NaN) === 422;
-  }
-
-  function isNetworkError(e) {
-    if (!e) return false;
-    if (typeof e.status !== "number") return true; // fetch failure
-    return e.status === 0;
-  }
-
-  async function sendBatchWithRetry(items) {
-    let lastErr = null;
-    STATE.metrics.flushAttempts++;
-    for (let attempt = 0; attempt <= FLUSH_RETRY_DELAYS_MS.length; attempt++) {
-      try {
-        const res = await chrome.runtime.sendMessage({
-          type: "PEGASUS_INGEST_BATCH",
-          scanId: STATE.scanId,
-          keyword: STATE.keyword,
-          country: STATE.country,
-          items,
-          totalAds: STATE.totalFound,
-        });
-        if (res?.ok === false) {
-          // SW returned a structured error (auth/validation/transient).
-          const err = new Error(res.error || "ingest failed");
-          err.status = res.status;
-          throw err;
-        }
-        // Successo
-        if (res?.scanId && !STATE.scanId) STATE.scanId = res.scanId;
-        STATE.metrics.flushSuccesses++;
-        return res;
-      } catch (e) {
-        lastErr = e;
-        // Auth/validation: STOP — non ha senso ritentare.
-        if (isAuthError(e)) {
-          STATE.abortReason = "auth_error";
-          log(t("cs.log.flushAuthAbort", { status: e?.status ?? "?" }));
-          throw e;
-        }
-        if (isValidationError(e)) {
-          STATE.abortReason = "validation_error";
-          throw e;
-        }
-        // Ultimo tentativo: lascia esplodere.
-        if (attempt === FLUSH_RETRY_DELAYS_MS.length) break;
-        const baseDelay = FLUSH_RETRY_DELAYS_MS[attempt];
-        const delayMs = jitter(baseDelay);
-        log(t("cs.log.flushRetry", { n: attempt + 1, ms: delayMs, err: e?.message ?? e }));
-        await new Promise((r) => setTimeout(r, delayMs));
-      }
-    }
-    STATE.metrics.flushFailures++;
-    throw lastErr || new Error("flush failed");
-  }
-
   async function flushBatch(force = false) {
     if (STATE.batch.length === 0) return;
     if (!force && STATE.batch.length < BATCH_FLUSH_SIZE) return;
-
-    // Queue mode: non flushare, accumula. Il timer di recovery proverà ogni 60s.
-    if (STATE.queueMode) {
-      updateOverlayQueueMode();
-      return;
-    }
-
-    // Semaforo: max 3 batch in volo. Se siamo già al limite, esci silently;
-    // il prossimo tick proverà di nuovo.
-    if (inFlightFlushes >= MAX_PARALLEL_FLUSHES) {
-      return;
-    }
-
-    // Stacca il batch ATOMICAMENTE per evitare race con altri flush concorrenti.
-    const items = STATE.batch.splice(0, BATCH_FLUSH_SIZE);
-    if (items.length === 0) return;
-    STATE.sinceLastBatch = Math.max(0, STATE.sinceLastBatch - items.length);
-
-    inFlightFlushes++;
-    if (inFlightFlushes > 1) {
-      log(t("cs.log.parallelFlush", { n: inFlightFlushes }));
-    }
-
+    const items = STATE.batch.splice(0, STATE.batch.length);
+    STATE.sinceLastBatch = 0;
     try {
-      const res = await sendBatchWithRetry(items);
+      const res = await chrome.runtime.sendMessage({
+        type: "PEGASUS_INGEST_BATCH",
+        scanId: STATE.scanId,
+        keyword: STATE.keyword,
+        country: STATE.country,
+        items,
+        totalAds: STATE.totalFound,
+      });
+      if (res?.scanId && !STATE.scanId) STATE.scanId = res.scanId;
       log(t("cs.log.batchSent", { n: items.length, tot: STATE.totalFound }));
+      // Aggiorna overlay live col totalStores reale dal server (computato via
+      // DISTINCT split_part lato Postgres — fonte di verità).
       updateOverlay({
         totalStores: res?.totalStores,
         sent: STATE.totalFound - STATE.batch.length,
       });
-      // Reset network fail counter on success.
-      STATE.consecutiveNetworkFails = 0;
-      // If we were in queue mode, exit it and let the queue drain.
-      if (STATE.queueMode) {
-        STATE.queueMode = false;
-        log(t("cs.log.queueModeOff", { n: STATE.batch.length }));
-        updateOverlayQueueMode();
-      }
     } catch (e) {
       logErr(t("cs.log.ingestFail", { err: e?.message ?? e }));
-      // Re-queue items at the front so we retry them later.
+      // Reinserisci a coda — meglio riprovare al prossimo flush.
       STATE.batch.unshift(...items);
-
-      if (isNetworkError(e)) {
-        STATE.consecutiveNetworkFails++;
-        if (STATE.consecutiveNetworkFails >= NETWORK_FAIL_THRESHOLD && !STATE.queueMode) {
-          STATE.queueMode = true;
-          log(t("cs.log.queueModeOn", { n: STATE.batch.length }));
-          updateOverlayQueueMode();
-          // Retry every 60s — wake up the queue when network is back.
-          if (queueModeTimer) clearTimeout(queueModeTimer);
-          queueModeTimer = setTimeout(async () => {
-            STATE.queueMode = false;
-            await flushBatch(true);
-          }, QUEUE_MODE_RETRY_MS);
-        }
+      // Se la chiave è invalida, fermiamo.
+      if (/401|403/.test(String(e?.status ?? "") + String(e?.message ?? ""))) {
+        STATE.abortReason = "auth_error";
       }
-    } finally {
-      inFlightFlushes--;
-    }
-
-    // Se ci sono ancora item in coda e siamo sotto il semaforo, prova un altro
-    // flush parallelo subito — sfrutta la capacità libera.
-    if (STATE.batch.length >= BATCH_FLUSH_SIZE && inFlightFlushes < MAX_PARALLEL_FLUSHES && !STATE.queueMode) {
-      // Fire-and-forget: non aspettare, prossimo flush in parallelo.
-      flushBatch(false).catch(() => {});
     }
   }
 
@@ -1190,40 +504,27 @@
   function stopFlushTimer() {
     if (flushTimer) clearInterval(flushTimer);
     flushTimer = null;
-    if (queueModeTimer) clearTimeout(queueModeTimer);
-    queueModeTimer = null;
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // SCROLL — v0.7.0 variability anti-detection
-  //
-  // Vecchio comportamento: sempre scroll-to-bottom. Detection risk: pattern
-  // troppo regolare. Nuovo: 80% bottom, 15% al 80%, 5% al 60%. Simula utente
-  // che scrolla "esplorando" invece di vacuum-cleaner.
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  function scrollVariable() {
+  function scrollToBottom() {
     const h = document.documentElement.scrollHeight;
-    const r = Math.random();
-    let targetRatio = 1.0;
-    if (r < 0.05) targetRatio = 0.60;
-    else if (r < 0.20) targetRatio = 0.80;
-    // else default 1.0 (80%)
-    const top = Math.round(h * targetRatio);
-    window.scrollTo({ top, behavior: "instant" });
-
-    // Always re-pin to bottom on the next tick if we're at 1.0, so FB's
-    // IntersectionObserver triggers on the last card.
-    if (targetRatio === 1.0) {
-      try {
-        const cards = findAdCards();
-        const last = cards[cards.length - 1];
-        if (last && typeof last.scrollIntoView === "function") {
-          last.scrollIntoView({ behavior: "instant", block: "end" });
-          window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" });
-        }
-      } catch {}
-    }
+    // Primary: window-level scroll. Works when the tab is visible.
+    window.scrollTo({ top: h, behavior: "instant" });
+    // Boost (v0.6.0): scrollIntoView on the last card triggers FB's
+    // IntersectionObserver-based lazy-load even when the tab is in
+    // background. Plain window.scrollTo doesn't always do that — FB's
+    // virtualized list listens for an element entering the viewport,
+    // and `scrollIntoView` synthesizes that event reliably.
+    try {
+      const cards = findAdCards();
+      const last = cards[cards.length - 1];
+      if (last && typeof last.scrollIntoView === "function") {
+        last.scrollIntoView({ behavior: "instant", block: "end" });
+        // Re-pin to the absolute bottom so the next cycle still detects
+        // page-height growth correctly.
+        window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" });
+      }
+    } catch {}
     return h;
   }
 
@@ -1233,17 +534,25 @@
    */
   async function recoveryKick() {
     log(t("cs.log.recoveryKick"));
-    STATE.metrics.recoveryKicks++;
     window.scrollTo({ top: 0, behavior: "instant" });
     await new Promise((r) => setTimeout(r, 1500));
     window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" });
     await new Promise((r) => setTimeout(r, 3000));
   }
 
+  /**
+   * Conta le card attualmente nel DOM. Usato per detect nuovi annunci dopo
+   * uno scroll: se il count cresce → FB ha caricato altro.
+   */
   function currentCardCount() {
     return findAdCards().length;
   }
 
+  /**
+   * Aspetta fino a MAX_WAIT_NEW_CONTENT_MS che appaiano nuove card o che
+   * il page-height cresca. Ritorna true se qualcosa è cambiato, false se
+   * timeout.
+   */
   async function waitForNewContent(prevCards, prevHeight) {
     const start = Date.now();
     while (Date.now() - start < MAX_WAIT_NEW_CONTENT_MS) {
@@ -1255,57 +564,9 @@
     return false;
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // SPEED COMPUTATION — sliding window 60s
-  // Ritorna ads/min calcolato sugli ultimi 60s di foundTimestamps.
-  // ═══════════════════════════════════════════════════════════════════════════
-  function computeSpeed() {
-    const now = Date.now();
-    const cutoff = now - SPEED_WINDOW_MS;
-    let count = 0;
-    // Walk backward (più nuovi in coda) finché non sono fuori window.
-    for (let i = STATE.foundTimestamps.length - 1; i >= 0; i--) {
-      if (STATE.foundTimestamps[i] < cutoff) break;
-      count++;
-    }
-    // Normalizza a per-minute. Se la scan è iniziata <60s fa, scala in proporzione
-    // così non sottostimiamo all'inizio.
-    const windowActiveMs = Math.min(SPEED_WINDOW_MS, now - STATE.startedAt);
-    if (windowActiveMs < 1000) return 0;
-    return Math.round((count / windowActiveMs) * 60_000);
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // ADAPTIVE PACING
-  //
-  // Sliding window di 3 cicli: se in media >10 nuovi ad/ciclo → -30% pace.
-  // Se 0 → +50% (lascia respirare prima di dichiarare stagnazione).
-  // ═══════════════════════════════════════════════════════════════════════════
-  function adjustPace(newAdsThisCycle) {
-    STATE.adsPerCycleWindow.push(newAdsThisCycle);
-    if (STATE.adsPerCycleWindow.length > 3) STATE.adsPerCycleWindow.shift();
-
-    if (STATE.adsPerCycleWindow.length < 3) return; // Aspetta che il window sia pieno.
-
-    const avg = STATE.adsPerCycleWindow.reduce((a, b) => a + b, 0) / 3;
-    if (avg > 10) {
-      const next = Math.max(SCROLL_CYCLE_MS_MIN, Math.round(STATE.currentCycleMs * 0.7));
-      if (next !== STATE.currentCycleMs) {
-        log(t("cs.log.paceFaster", { n: Math.round(avg) }));
-        STATE.currentCycleMs = next;
-      }
-    } else if (avg === 0) {
-      const next = Math.min(SCROLL_CYCLE_MS_MAX, Math.round(STATE.currentCycleMs * 1.5));
-      if (next !== STATE.currentCycleMs) {
-        log(t("cs.log.paceSlower"));
-        STATE.currentCycleMs = next;
-      }
-    }
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // PERSIST PROGRESS — v0.6.0 (storage write per ciclo) + v0.7.0 enrichments
-  // ═══════════════════════════════════════════════════════════════════════════
+  // v0.6.0 — persist scan progress to chrome.storage.local. The service
+  // worker can resurrect a stale scan after a tab crash by reading this.
+  // Best-effort: storage write failure is silent.
   async function persistProgress() {
     try {
       await chrome.storage.local.set({
@@ -1329,7 +590,10 @@
     }
   }
 
-  // v0.6.0 — visibilitychange handler.
+  // v0.6.0 — visibilitychange handler. The keep-alive audio prevents most
+  // throttling, but FB's lazy-load occasionally pauses while the tab is
+  // hidden. When the tab is brought back, fire a recovery kick so the
+  // user sees fresh progress the moment they look at the page.
   function setupVisibilityHandler() {
     document.addEventListener("visibilitychange", () => {
       if (!STATE.scanning) return;
@@ -1337,13 +601,12 @@
         log(t("cs.log.visibilityHidden"));
       } else if (document.visibilityState === "visible") {
         log(t("cs.log.visibilityVisible"));
-        if (keepAlive.audio?.ctx?.state === "suspended") {
-          keepAlive.audio.ctx.resume().catch(() => {});
+        // Resume the AudioContext if Chrome suspended it (some browsers do
+        // this when the user revokes media autoplay).
+        if (keepAliveHandle?.ctx?.state === "suspended") {
+          keepAliveHandle.ctx.resume().catch(() => {});
         }
-        // Re-acquire wake lock if it was dropped while hidden.
-        if (!keepAlive.wakeLock && navigator.wakeLock) {
-          tryWakeLockKeepAlive().catch(() => {});
-        }
+        // Async fire-and-forget recovery kick + collect.
         (async () => {
           await recoveryKick();
           collectFromVisibleCards();
@@ -1352,116 +615,45 @@
     });
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // RESUME FROM STALE STATE — v0.7.0
-  //
-  // Al boot, se troviamo pegasus_scrape_state recente (<5min), chiediamo al SW
-  // se vuole che riprendiamo. Il SW conferma se ha ancora un RUNTIME.scanId.
-  // ═══════════════════════════════════════════════════════════════════════════
-  async function maybeResume() {
-    try {
-      const obj = await chrome.storage.local.get("pegasus_scrape_state");
-      const stale = obj?.pegasus_scrape_state;
-      if (!stale || !stale.scanning) return;
-      const ageMs = Date.now() - (stale.timestamp || 0);
-      if (ageMs > RESUME_MAX_AGE_MS) return;
-      const ageSec = Math.round(ageMs / 1000);
-      log(t("cs.log.resumeFound", { n: stale.totalFound || 0, age: ageSec }));
-
-      // Handshake col SW: vuole davvero che riprendiamo?
-      const resp = await chrome.runtime.sendMessage({
-        type: "PEGASUS_RESUME",
-        scanId: stale.scanId,
-        keyword: stale.keyword,
-        country: stale.country,
-        totalFound: stale.totalFound,
-      });
-      if (!resp?.ok) {
-        log(t("cs.log.resumeRejected"));
-        return;
-      }
-      // Ripopola STATE e riparti.
-      STATE.scanId = stale.scanId;
-      STATE.keyword = stale.keyword;
-      STATE.country = stale.country;
-      STATE.limit = stale.limit || 0;
-      STATE.totalFound = stale.totalFound || 0;
-      STATE.seen = new Set(Array.isArray(stale.seen) ? stale.seen : []);
-      STATE.startedAt = stale.startedAt || Date.now();
-      STATE.scanning = true;
-      STATE.abortReason = null;
-      STATE.cycles = stale.cycles || 0;
-      mainLoop().catch((e) => logErr("Resume loop failed: " + (e?.message ?? e)));
-    } catch {
-      // Storage error or SW down — ignore, manual start funzionerà.
-    }
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // MAIN LOOP — v0.7.0 with adaptive pacing + observer + idle micro-pauses
-  // ═══════════════════════════════════════════════════════════════════════════
   async function mainLoop() {
     log(t("cs.log.scanStart"));
-    STATE.startedAt = STATE.startedAt || Date.now();
-    STATE.metrics.startedAt = STATE.startedAt;
-    STATE.currentCycleMs = SCROLL_CYCLE_MS_BASE;
     startFlushTimer();
-
-    // Multi-strategy keep-alive (audio → webrtc → wakelock).
+    // v0.6.0 — start anti-throttling audio + visibility handler BEFORE the
+    // first scroll cycle so the tab is exempt from background throttling
+    // from the very first second.
     startKeepAlive();
     setupVisibilityHandler();
-
-    // Live overlay UI.
+    // Inject the live overlay UI on top-right of the page. Killer UX of v0.2.0.
     try {
       createOverlay(STATE.keyword, STATE.country);
-      updateOverlayKeepAlive();
     } catch (e) {
       logErr(t("cs.log.overlayFail", { err: e?.message ?? e }));
     }
 
-    // IntersectionObserver setup. Fallback to polling if unavailable.
-    const observerOk = setupCardObserver();
-
-    // First pass: process whatever's already in the DOM (the observer only
-    // fires on FUTURE intersections; existing cards need a manual sweep).
-    collectFromVisibleCards();
-    if (observerOk) attachObserverToNewCards();
-
-    let pausedForIdleCycles = 0;
-
     while (STATE.scanning && !STATE.abortReason) {
       STATE.cycles++;
-      STATE.metrics.cycles = STATE.cycles;
       const before = STATE.totalFound;
 
-      // 1) Raccolta esplicita (se observer disponibile, è quasi sempre no-op:
-      //    le card già le abbiamo prese in real-time).
+      // 1) Raccogli quello che vediamo adesso
       collectFromVisibleCards();
       if (STATE.abortReason) break;
 
       // 2) Snapshot pre-scroll per detect crescita
       const prevCards = currentCardCount();
-      const prevHeight = scrollVariable();
+      const prevHeight = scrollToBottom();
 
       // 3) Aspetta che nuove card appaiano o il page-height cresca (max 8s)
       const grew = await waitForNewContent(prevCards, prevHeight);
 
-      // 4) Re-attach observer alle (eventuali) nuove card + re-raccogli
-      if (observerOk) attachObserverToNewCards();
+      // 4) Re-raccolgi dopo l'attesa
       collectFromVisibleCards();
       const newItems = STATE.totalFound - before;
-      STATE.metrics.cardsPerCycle.push(newItems);
-      // Cap il log array per non far esplodere la memoria su run lunghi.
-      if (STATE.metrics.cardsPerCycle.length > 1000) STATE.metrics.cardsPerCycle.shift();
 
-      // 5) Adaptive pacing — modula currentCycleMs in base alla resa.
-      adjustPace(newItems);
-
-      // 6) Stagnazione detect
+      // 5) Detect stagnazione: né crescita DOM né nuovi item nostri
       if (!grew && newItems === 0) {
         STATE.sinceLastScrollGrowth++;
-        STATE.metrics.stagnationStreak = STATE.sinceLastScrollGrowth;
 
+        // Tenta recovery ogni RECOVERY_EVERY_CYCLES cicli stagnanti
         if (
           STATE.sinceLastScrollGrowth > 0 &&
           STATE.sinceLastScrollGrowth % RECOVERY_EVERY_CYCLES === 0
@@ -1477,10 +669,9 @@
         }
       } else {
         STATE.sinceLastScrollGrowth = 0;
-        STATE.metrics.stagnationStreak = 0;
       }
 
-      // 7) Push metrics al popup + aggiorna overlay live
+      // 6) Push metrics al popup + aggiorna overlay live
       const sentCount = STATE.totalFound - STATE.batch.length;
       chrome.runtime.sendMessage({
         type: "PEGASUS_METRICS",
@@ -1491,59 +682,31 @@
         totalFound: STATE.totalFound,
         sent: Math.max(0, sentCount),
       });
-      updateOverlaySpeed();
-      updateOverlayKeepAlive();
-      updateOverlayQueueMode();
 
-      // 8) Persist progress every cycle so a tab crash doesn't lose state.
+      // 7) Persist progress every cycle so a tab crash doesn't lose state.
+      // Storage write is cheap and async — doesn't block the loop.
       persistProgress();
 
-      // 9) Random idle micro-pause: 1 ogni ~8 cicli, 6-12s extra. Simula
-      //    utente che si ferma a leggere un ad — pattern anti-detection.
-      pausedForIdleCycles++;
-      if (pausedForIdleCycles >= 8 && Math.random() < 0.2) {
-        const pauseSec = 6 + Math.floor(Math.random() * 7); // 6..12
-        log(t("cs.log.idleMicroPause", { s: pauseSec }));
-        await new Promise((r) => setTimeout(r, pauseSec * 1000));
-        pausedForIdleCycles = 0;
-      }
-
-      // 10) Pausa con jitter prima del prossimo ciclo (pace adattivo).
-      await new Promise((r) => setTimeout(r, jitter(STATE.currentCycleMs)));
+      // 8) Pausa con jitter prima del prossimo ciclo (pace anti-detection)
+      await new Promise((r) => setTimeout(r, jitter(SCROLL_CYCLE_MS)));
     }
 
     stopFlushTimer();
     stopKeepAlive();
-    // Disconnetti l'observer (la WeakSet è già garbage-collectable).
-    if (cardObserver) {
-      try { cardObserver.disconnect(); } catch {}
-      cardObserver = null;
-    }
-    // Drain residuo: flush forzato di tutto quello che resta in coda.
-    while (STATE.batch.length > 0) {
-      try {
-        await flushBatch(true);
-      } catch {
-        break; // se fallisce, lasciamo cadere — il finalize() lato server tracking
-      }
-      if (STATE.batch.length === 0) break;
-      // Se siamo bloccati in queue mode al termine, esci comunque.
-      if (STATE.queueMode) break;
-    }
-    // Clear persisted state on natural completion.
+    await flushBatch(true);
+    // Clear persisted state on natural completion so the next scan starts
+    // fresh. (Crash-recovery path would find a non-cleared row and resume.)
     try { await chrome.storage.local.remove("pegasus_scrape_state"); } catch {}
 
-    STATE.metrics.endedAt = Date.now();
     chrome.runtime.sendMessage({
       type: "PEGASUS_DONE",
       scanId: STATE.scanId,
       totalFound: STATE.totalFound,
       reason: STATE.abortReason ?? "stopped",
       durationMs: Date.now() - STATE.startedAt,
-      metrics: STATE.metrics,
     });
 
-    // Final overlay
+    // Final overlay update: green dot if completed naturally, red on error
     const ok =
       STATE.abortReason === "limit" ||
       STATE.abortReason === "stagnant" ||
@@ -1564,6 +727,7 @@
         t("overlay.status.stoppedReason", { reason: STATE.abortReason || "stopped" }),
       );
     }
+    // Lascio l'overlay visibile per 30s così l'utente legge il risultato
     setTimeout(() => removeOverlay(), 30_000);
 
     log(t("cs.log.scanDone", { n: STATE.totalFound, reason: STATE.abortReason }));
@@ -1589,25 +753,7 @@
       STATE.abortReason = null;
       STATE.cycles = 0;
       STATE.startedAt = Date.now();
-      STATE.foundTimestamps = [];
-      STATE.queueMode = false;
-      STATE.consecutiveNetworkFails = 0;
-      STATE.adsPerCycleWindow = [];
-      STATE.currentCycleMs = SCROLL_CYCLE_MS_BASE;
-      STATE.metrics = {
-        cycles: 0,
-        cardsPerCycle: [],
-        flushAttempts: 0,
-        flushSuccesses: 0,
-        flushFailures: 0,
-        recoveryKicks: 0,
-        stagnationStreak: 0,
-        keepAliveStrategy: "none",
-        startedAt: Date.now(),
-        endedAt: null,
-      };
-      observedCards = new WeakSet();
-      mainLoop().catch((e) => logErr("Main loop crashed: " + (e?.message ?? e)));
+      mainLoop();
       sendResponse({ ok: true });
       return false;
     }
@@ -1616,18 +762,6 @@
       STATE.scanning = false;
       STATE.abortReason = "user_stop";
       sendResponse({ ok: true });
-      return false;
-    }
-
-    // v0.7.0 — heartbeat ping. SW invia ogni 30s; se non rispondiamo per 2 ping
-    // di fila, SW dichiara CS morto e tenta re-inject via chrome.scripting.
-    if (msg?.type === "PEGASUS_HEARTBEAT") {
-      sendResponse({
-        ok: true,
-        scanning: STATE.scanning,
-        totalFound: STATE.totalFound,
-        cycles: STATE.cycles,
-      });
       return false;
     }
 
@@ -1643,8 +777,4 @@
 
   // Annuncia al service worker che il content script è pronto
   chrome.runtime.sendMessage({ type: "PEGASUS_CS_READY", href: location.href }).catch(() => {});
-
-  // v0.7.0 — al boot, check se c'è uno scan stale da riprendere.
-  // Fire-and-forget — il manuale "Start" funziona comunque.
-  maybeResume().catch(() => {});
 })();

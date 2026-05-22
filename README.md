@@ -1,57 +1,12 @@
-# Pegasus Hunter — Chrome Extension v0.7.0 (Steroids Edition)
+# Pegasus Hunter — Chrome Extension v0.2.0
 
-Scansiona Facebook Ads Library con **overlay live** sulla pagina, estrae i link prodotto su Shopify/WooCommerce/BigCommerce/Wix/Squarespace/ClickFunnels e li manda alla dashboard Pegasus Hunter (`pegasushunter.com`).
+Scansiona Facebook Ads Library con **overlay live** sulla pagina, estrae i link Shopify dei prodotti pubblicizzati e li manda alla dashboard Pegasus Hunter (`pegasushunter.com`).
 
-## Cosa cambia in v0.7.0 — Steroids Edition
+## Cosa cambia in v0.2.0 rispetto alla v0.1.1
 
-**Performance**
-
-- IntersectionObserver real-time: niente più polling DOM, le card vengono processate appena entrano in viewport.
-- Parallel flush: fino a 3 batch in volo contemporaneamente verso il backend.
-- Adaptive scroll pacing: -30% se la resa è alta, +50% se cala. Il loop si calibra da solo.
-- DOM micro-cache 500ms per `findAdCards()`.
-
-**Data richness**
-
-- Estrazione di 12+ campi per ad: `advertiser`, `advertiser_url`, `imageUrl`, `videoUrl`, `activeAds`, `adStartDate`, `libraryId`, `ctaText`, `headline`, `bodyText`, `displayDomain`, `platforms`, e detection automatica di `platform` (shopify/woocommerce/bigcommerce/wix/squarespace/clickfunnels).
-
-**Robustness**
-
-- Auto-resume da scan crashati (handshake CS↔SW via `chrome.storage.local` + `PEGASUS_RESUME`).
-- Retry esponenziale 3× (1s, 3s, 9s con jitter ±30%) per ogni flush. Stop immediato su 401/403/422.
-- Heartbeat alarm 30s SW→CS: se 2 miss consecutivi, re-inject del CS via `chrome.scripting`.
-- Queue mode offline: 3 fail network → accumulo senza flush per 60s, poi retry.
-
-**Anti-detection**
-
-- Variabilità scroll: 80% bottom, 15% al 80%, 5% al 60%.
-- Random idle micro-pauses di 6-12s ogni ~8 cicli (simula utente che legge).
-
-**Background reliability**
-
-- Multi-strategy keep-alive: AudioContext → WebRTC fallback → Wake Lock bonus. La extension testa in cascata e usa la prima strategy disponibile.
-
-**UX**
-
-- Riga "Speed: X ads/min" calcolata su sliding window 60s.
-- Badge keep-alive (Audio/WebRTC/WakeLock/None).
-- Banner "Network slow — buffering N items" in queue mode.
-
-**Selectors resilience**
-
-- Triplo fallback per `findAdCards()`: `[role="article"]` → `[role="main"]>div>div>div` con >=3 figli → brute-force pattern (img + l.php + testo "X ads"). Log della strategy "vincente".
-
-**Telemetria interna**
-
-- `STATE.metrics` raccoglie cycles, cardsPerCycle, flushAttempts/Successes/Failures, recoveryKicks, stagnationStreak, keepAliveStrategy. Inviato al SW al `PEGASUS_DONE` (logging locale, no upload backend).
-
-## Versioni precedenti
-
-- `v0.6.0` — Keep-alive audio + visibility recovery + state persistence.
-- `v0.5.0` — Exponential backoff retry su ingest.
-- `v0.4.0` — Live badge counter sull'icona estensione.
-- `v0.3.0` — i18n IT/EN auto-detect.
-- `v0.2.0` — Merge in Pegasus Hunter (backend FastAPI + overlay live).
+- **Backend nuovo**: parla con `api.pegasushunter.com/api/v1/*` (FastAPI central server), non più con `wooshstoreai.com`. Auth via Bearer `wsk_…`.
+- **Overlay live UI**: durante lo scraping, in alto a destra della pagina FB Ads Library appare un widget fisso con contatori in tempo reale (annunci trovati, shop unici, batch sincronizzati). Bottoni Stop / Apri Dashboard. Killer UX feature.
+- **Branding**: "Pegasus Scanner" → "Pegasus Hunter".
 
 ## Installazione (sviluppo)
 
@@ -147,8 +102,3 @@ Durante lo scraping, l'estensione inietta un widget fisso top-right della pagina
 - `0.1.0` — MVP iniziale Pegasus-Store
 - `0.1.1` — Scroll smart + multilingua detection
 - `0.2.0` — Merge in Pegasus Hunter (nuovo backend FastAPI + overlay live)
-- `0.3.0` — i18n IT/EN
-- `0.4.0` — Badge live sull'icona
-- `0.5.0` — Retry esponenziale ingest
-- `0.6.0` — Keep-alive audio + visibility recovery
-- `0.7.0` — Steroids Edition (IO observer + parallel flush + multi-keepalive + auto-resume + 12+ fields + multi-platform)
