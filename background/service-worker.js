@@ -1,14 +1,15 @@
 // Pegasus Scanner — service worker (background).
 //
-// Responsibilità:
+// Responsabilità:
 //   1) Riceve START dal popup → apre tab FB Ads Library con URL keyword/paese.
 //   2) Aspetta che il content script si annunci READY.
 //   3) Invia START al content script.
-//   4) Inoltra i batch dal content script all'API server (wooshstoreai.com).
+//   4) Inoltra i batch dal content script all'API server (pegasushunter.com).
 //   5) Propaga metrics/log al popup quando aperto.
 //   6) Gestisce STOP / chiusura tab.
-//   7) (v0.4.0) Aggiorna il badge dell'icona dell'estensione con il contatore
-//      di annunci trovati durante la scansione + colore di stato.
+//   7) (v0.4.0) Badge dell'icona dell'estensione con contatore live.
+//   8) (v0.7.0) Heartbeat ogni 30s + re-inject del CS se morto.
+//   9) (v0.7.0) RESUME handshake per scan crashati.
 //
 // Tutto è async + state machine semplice. Lo stato vive in chrome.storage.local
 // così sopravvive a sleep/wake del service worker.
@@ -63,7 +64,20 @@ const RUNTIME = {
   status: "idle", // idle|opening_tab|waiting_cs|scanning|finalizing|completed|error
   lastError: null,
   startedAt: null,
+  // v0.7.0 — heartbeat health
+  lastHeartbeatAt: null,
+  missedHeartbeats: 0,
+  // v0.7.0 — metrics ricevute dal CS al PEGASUS_DONE (telemetria locale)
+  lastMetrics: null,
 };
+
+// ── v0.7.0 — Heartbeat constants ────────────────────────────────────────
+// Ogni 30s pinghiamo il CS via chrome.alarms (più affidabile di setInterval:
+// sopravvive a sleep del service worker MV3). Se manca 2 ping consecutivi,
+// dichiariamo il CS morto e tentiamo re-inject via chrome.scripting.
+const HEARTBEAT_ALARM = "pegasus_cs_heartbeat";
+const HEARTBEAT_PERIOD_MIN = 0.5; // minutes — chrome.alarms minimum is 0.5min in MV3
+const HEARTBEAT_MAX_MISSED = 2;
 
 async function persistRuntime() {
   await storage.setCurrentScan({
@@ -126,6 +140,9 @@ async function startScan({ keyword, country, limit }) {
   RUNTIME.lastError = null;
   RUNTIME.startedAt = Date.now();
   RUNTIME.status = "opening_tab";
+  RUNTIME.lastHeartbeatAt = null;
+  RUNTIME.missedHeartbeats = 0;
+  RUNTIME.lastMetrics = null;
   await persistRuntime();
   broadcastToPopup({ type: "PEGASUS_STATE", state: { ...RUNTIME } });
   // Show "..." while the FB tab is loading (before the first batch lands).
@@ -161,9 +178,13 @@ async function startScan({ keyword, country, limit }) {
     });
     if (!resp?.ok) throw new Error(resp?.error ?? "Avvio content script fallito");
     RUNTIME.status = "scanning";
+    RUNTIME.lastHeartbeatAt = Date.now();
     setBadge("0", BADGE_GREEN);
     await persistRuntime();
     broadcastToPopup({ type: "PEGASUS_STATE", state: { ...RUNTIME } });
+    // v0.7.0 — alarms-based heartbeat. Sopravvive al sleep del SW MV3 (al
+    // contrario di setInterval) e ping al CS ogni 30s.
+    startHeartbeatAlarm();
   } catch (e) {
     RUNTIME.status = "error";
     RUNTIME.lastError = `Content script: ${e?.message ?? e}`;
@@ -182,10 +203,69 @@ async function stopScan() {
     }
   }
   RUNTIME.status = "idle";
+  stopHeartbeatAlarm();
   await persistRuntime();
   broadcastToPopup({ type: "PEGASUS_STATE", state: { ...RUNTIME } });
   clearBadge();
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v0.7.0 — Heartbeat alarm: ping CS ogni 30s; se 2 mancati, re-inject.
+// ═══════════════════════════════════════════════════════════════════════════
+function startHeartbeatAlarm() {
+  try {
+    chrome.alarms?.create?.(HEARTBEAT_ALARM, { periodInMinutes: HEARTBEAT_PERIOD_MIN });
+  } catch {
+    // chrome.alarms may be unavailable on some Chromium forks; silent.
+  }
+}
+
+function stopHeartbeatAlarm() {
+  try { chrome.alarms?.clear?.(HEARTBEAT_ALARM); } catch {}
+  RUNTIME.missedHeartbeats = 0;
+}
+
+async function reinjectContentScript(tabId) {
+  // Best-effort: usa chrome.scripting per re-iniettare i18n + content script.
+  // Funziona solo se permessi `scripting` + host permissions sulla tab matchano
+  // — abbiamo entrambi. Niente di rumoroso lato user: il CS si re-annuncia READY.
+  try {
+    await chrome.scripting?.executeScript?.({
+      target: { tabId },
+      files: ["lib/i18n.js", "content-scripts/fb-ads-extract.js"],
+    });
+    console.log("[Pegasus] CS re-injected after missed heartbeats");
+  } catch (e) {
+    console.warn("[Pegasus] CS re-inject failed:", e?.message ?? e);
+  }
+}
+
+async function onHeartbeatTick() {
+  if (RUNTIME.status !== "scanning" || !RUNTIME.scanTabId) return;
+  try {
+    const r = await chrome.tabs.sendMessage(RUNTIME.scanTabId, { type: "PEGASUS_HEARTBEAT" });
+    if (r?.ok) {
+      RUNTIME.lastHeartbeatAt = Date.now();
+      RUNTIME.missedHeartbeats = 0;
+    } else {
+      RUNTIME.missedHeartbeats++;
+    }
+  } catch {
+    // Il CS può essere morto (tab refresh, navigation, crash). Conta il miss.
+    RUNTIME.missedHeartbeats++;
+  }
+  if (RUNTIME.missedHeartbeats >= HEARTBEAT_MAX_MISSED) {
+    console.warn(`[Pegasus] CS missed ${RUNTIME.missedHeartbeats} heartbeats — re-injecting`);
+    RUNTIME.missedHeartbeats = 0;
+    if (RUNTIME.scanTabId) await reinjectContentScript(RUNTIME.scanTabId);
+  }
+}
+
+chrome.alarms?.onAlarm?.addListener?.((alarm) => {
+  if (alarm.name === HEARTBEAT_ALARM) {
+    onHeartbeatTick().catch(() => {});
+  }
+});
 
 // === Handler dei messaggi dal content script (e dal popup) ===
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -220,6 +300,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true });
           break;
         }
+        // v0.7.0 — handshake di resume. Il CS lo manda al boot se trova uno
+        // scan stato persistito <5min. Confermiamo se il RUNTIME locale
+        // ha ancora un scanId compatibile (stesso scan), altrimenti rigetto.
+        case "PEGASUS_RESUME": {
+          const sameKeyword = msg.keyword && RUNTIME.keyword && msg.keyword === RUNTIME.keyword;
+          const stillScanning = RUNTIME.status === "scanning" || RUNTIME.status === "waiting_cs";
+          if (stillScanning && sameKeyword) {
+            sendResponse({ ok: true, scanId: RUNTIME.scanId });
+          } else {
+            sendResponse({ ok: false, reason: "no_active_scan_for_keyword" });
+          }
+          break;
+        }
         case "PEGASUS_INGEST_BATCH": {
           try {
             const res = await api.ingest({
@@ -247,13 +340,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               autoTracked: res?.autoTracked,
             });
           } catch (e) {
-            sendResponse({ ok: false, error: e?.message ?? String(e), status: e?.status });
+            // v0.7.0 — propaga status code al CS così può decidere se ritentare
+            // (5xx/network) o abortire (401/403/422).
+            sendResponse({ ok: false, error: e?.message ?? String(e), status: e?.status ?? 0 });
           }
           break;
         }
         case "PEGASUS_DONE": {
           RUNTIME.totalAds = msg.totalFound ?? RUNTIME.totalAds;
           RUNTIME.status = "finalizing";
+          // v0.7.0 — salva metriche del CS per debug futuro (no upload server).
+          if (msg.metrics) {
+            RUNTIME.lastMetrics = msg.metrics;
+            console.log("[Pegasus] CS metrics:", msg.metrics);
+          }
+          stopHeartbeatAlarm();
           await persistRuntime();
           try {
             if (RUNTIME.scanId) {
@@ -323,6 +424,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (tabId === RUNTIME.scanTabId && RUNTIME.status === "scanning") {
     RUNTIME.status = "error";
     RUNTIME.lastError = "Tab di scansione chiusa prima del termine";
+    stopHeartbeatAlarm();
     persistRuntime();
     broadcastToPopup({ type: "PEGASUS_STATE", state: { ...RUNTIME } });
     setBadge("!", BADGE_RED);
@@ -335,4 +437,6 @@ chrome.runtime.onInstalled.addListener(() => {
   // v0.4.0: belt-and-suspenders — clear any stale badge state from a
   // previous version after update.
   clearBadge();
+  // v0.7.0: clean stale heartbeat alarm da install precedenti.
+  stopHeartbeatAlarm();
 });
