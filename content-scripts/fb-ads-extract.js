@@ -454,6 +454,196 @@
     flushTimer = null;
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // "VEDI ALTRO" / "SEE MORE" PAGINATION — v0.8.0
+  //
+  // Pourquoi this is hard:
+  // Earlier attempts (v0.7.1 / v0.7.3) clicked the button with a plain
+  // `el.click()` and a 3s cooldown. FB rate-limits that pattern: it shows
+  // the spinner but never finishes loading. The user reported "rotella +
+  // click + rotella + click" forever.
+  //
+  // What actually works on FB:
+  //   1. Synthesize a realistic event sequence — pointerdown → mousedown →
+  //      pointerup → mouseup → click — so FB's React handlers see what
+  //      they'd see from a human pointer. Plain `.click()` skips the
+  //      pointer/mouse events and FB's heuristics flag the interaction.
+  //   2. Long cooldown (≥ 12 s). FB's "load more" XHR takes 3-8 s on slow
+  //      links; clicking again too soon trips the rate limiter.
+  //   3. Don't click while a spinner is visible near the button. If we see
+  //      one we wait up to 30 s for it to disappear.
+  //   4. Hard-abort after 3 consecutive clicks with zero new cards: at that
+  //      point FB has blocked us and retrying won't help — better to end
+  //      cleanly with reason "see_more_blocked" so the partial result is
+  //      still synced to the dashboard.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  const SEE_MORE_PATTERNS = [
+    /^\s*vedi\s+(altro|di\s+pi[uù]|altri)/i,         // IT
+    /^\s*mostra\s+(altro|di\s+pi[uù]|altri)/i,       // IT alt
+    /^\s*see\s+more/i,                                // EN
+    /^\s*show\s+more/i,                               // EN alt
+    /^\s*load\s+more/i,                               // EN alt
+    /^\s*ver\s+m[aá]s/i,                              // ES
+    /^\s*mostrar\s+m[aá]s/i,                          // ES alt
+    /^\s*voir\s+plus/i,                               // FR
+    /^\s*afficher\s+plus/i,                           // FR alt
+    /^\s*mehr\s+anzeigen/i,                           // DE
+    /^\s*mehr\s+laden/i,                              // DE alt
+    /^\s*meer\s+(bekijken|laden|weergeven)/i,         // NL
+    /^\s*ver\s+mais/i,                                // PT
+  ];
+  let lastSeeMoreClickAt = 0;
+  let seeMoreClicksWithoutGrowth = 0;
+  const SEE_MORE_COOLDOWN_MS = 12_000;
+  const SEE_MORE_MAX_DEAD_CLICKS = 3;
+  const SEE_MORE_SPINNER_WAIT_MS = 30_000;
+
+  function matchesSeeMore(text) {
+    if (!text || text.length > 60) return false;
+    return SEE_MORE_PATTERNS.some((re) => re.test(text));
+  }
+
+  function isInOrNearViewport(el) {
+    try {
+      const r = el.getBoundingClientRect();
+      const vh = window.innerHeight || document.documentElement.clientHeight;
+      return r.top < vh * 1.5 && r.bottom > -vh * 0.5 && r.width > 0 && r.height > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  // FB renders a spinner sibling-or-nearby when "load more" is in flight.
+  // It carries either role="progressbar", aria-busy="true", or is a <div>
+  // whose first child is an <svg> with a class containing "spin". We scan
+  // a small radius around the button so we don't trip on unrelated spinners
+  // on the page.
+  function isLoadingNearby() {
+    try {
+      const candidates = document.querySelectorAll(
+        '[role="progressbar"], [aria-busy="true"], svg[role="img"][aria-label*="oad" i], svg[aria-label*="aric" i]'
+      );
+      for (const el of candidates) {
+        if (isInOrNearViewport(el)) return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  // Dispatch a realistic pointer+mouse+click sequence. Each event carries
+  // bubbles:true so React's delegated listeners catch them. We anchor the
+  // synthetic coords at the button center so any handler that reads
+  // clientX/clientY gets sane numbers.
+  function realisticClick(el) {
+    try {
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const opts = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX: cx,
+        clientY: cy,
+        button: 0,
+        buttons: 1,
+        pointerType: "mouse",
+        isPrimary: true,
+      };
+      el.dispatchEvent(new PointerEvent("pointerover", opts));
+      el.dispatchEvent(new PointerEvent("pointerenter", opts));
+      el.dispatchEvent(new MouseEvent("mouseover", opts));
+      el.dispatchEvent(new MouseEvent("mousemove", opts));
+      el.dispatchEvent(new PointerEvent("pointerdown", opts));
+      el.dispatchEvent(new MouseEvent("mousedown", opts));
+      el.dispatchEvent(new PointerEvent("pointerup", { ...opts, buttons: 0 }));
+      el.dispatchEvent(new MouseEvent("mouseup", { ...opts, buttons: 0 }));
+      el.dispatchEvent(new MouseEvent("click", { ...opts, buttons: 0 }));
+    } catch {
+      // Fallback to plain click if PointerEvent constructor is unavailable
+      // (very old Chromium fork). Worse FB-detection profile but functional.
+      try { el.click(); } catch {}
+    }
+  }
+
+  function findSeeMoreButton() {
+    const candidates = document.querySelectorAll(
+      'div[role="button"], a[role="button"], button'
+    );
+    for (const el of candidates) {
+      const txt = (el.textContent || "").trim();
+      if (!matchesSeeMore(txt)) continue;
+      if (!isInOrNearViewport(el)) continue;
+      if (el.closest("#pegasus-overlay-host")) continue;
+      return { el, txt };
+    }
+    return null;
+  }
+
+  /**
+   * Tries to click a "Vedi altro" button. Returns:
+   *   - true  → click dispatched, caller should wait for content growth
+   *   - false → button not present, or in cooldown, or spinner still active
+   *
+   * Tracks consecutive dead clicks. After SEE_MORE_MAX_DEAD_CLICKS without
+   * any new card the scan aborts with reason "see_more_blocked".
+   */
+  async function clickSeeMoreIfPresent() {
+    if (Date.now() - lastSeeMoreClickAt < SEE_MORE_COOLDOWN_MS) return false;
+    if (isLoadingNearby()) {
+      // FB is already loading from a previous click; wait it out (up to 30s).
+      const waitStart = Date.now();
+      while (Date.now() - waitStart < SEE_MORE_SPINNER_WAIT_MS) {
+        await new Promise((r) => setTimeout(r, 1000));
+        if (!isLoadingNearby()) break;
+      }
+      // Still loading after 30s → FB is wedged, don't re-click yet.
+      if (isLoadingNearby()) return false;
+    }
+
+    const found = findSeeMoreButton();
+    if (!found) return false;
+
+    // Bring the button into view smoothly — humans hover and pause before
+    // clicking. The 600 ms wait gives FB time to mark the element as
+    // "hovered" before the click fires.
+    try {
+      found.el.scrollIntoView({ behavior: "instant", block: "center" });
+    } catch {}
+    await new Promise((r) => setTimeout(r, 600 + Math.random() * 400));
+
+    realisticClick(found.el);
+    lastSeeMoreClickAt = Date.now();
+    log(`Click "${found.txt.slice(0, 40)}" — attendo caricamento.`);
+
+    // Give FB up to 12 s to populate new cards. We don't return until either
+    // (a) DOM grew, or (b) we time out. Caller treats both as legitimate
+    // end-of-cycle.
+    const cardsBefore = currentCardCount();
+    const heightBefore = document.documentElement.scrollHeight;
+    const waitStart = Date.now();
+    while (Date.now() - waitStart < 12_000) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (
+        currentCardCount() > cardsBefore ||
+        document.documentElement.scrollHeight > heightBefore
+      ) {
+        seeMoreClicksWithoutGrowth = 0;
+        return true;
+      }
+    }
+    // No new content after the click.
+    seeMoreClicksWithoutGrowth++;
+    if (seeMoreClicksWithoutGrowth >= SEE_MORE_MAX_DEAD_CLICKS) {
+      logErr(
+        `"Vedi altro" cliccato ${seeMoreClicksWithoutGrowth} volte senza nuovi annunci — FB ha bloccato la paginazione, chiudo.`
+      );
+      STATE.abortReason = "see_more_blocked";
+    }
+    return true;
+  }
+
   function scrollToBottom() {
     const h = document.documentElement.scrollHeight;
     window.scrollTo({ top: h, behavior: "instant" });
@@ -518,8 +708,19 @@
       const prevCards = currentCardCount();
       const prevHeight = scrollToBottom();
 
-      // 3) Aspetta che nuove card appaiano o il page-height cresca (max 8s)
-      const grew = await waitForNewContent(prevCards, prevHeight);
+      // 2.5) v0.8.0 — if FB shows a "Vedi altro" button (the virtualized
+      //      list is exhausted), click it. The helper internally waits for
+      //      the resulting content load (up to 12 s) and handles cooldown,
+      //      spinner detection, and dead-click abort. Awaiting here is
+      //      safe: it either advances the page or returns quickly.
+      const clickedSeeMore = await clickSeeMoreIfPresent();
+      if (STATE.abortReason) break;
+
+      // 3) Aspetta che nuove card appaiano o il page-height cresca (max 8s).
+      //    If we just clicked "Vedi altro" the helper already waited up to
+      //    12s for growth, so we can skip the second wait window — saves a
+      //    pointless 8s per "see-more" cycle.
+      const grew = clickedSeeMore || (await waitForNewContent(prevCards, prevHeight));
 
       // 4) Re-raccolgi dopo l'attesa
       collectFromVisibleCards();
