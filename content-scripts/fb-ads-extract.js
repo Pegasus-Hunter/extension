@@ -1227,100 +1227,6 @@
     return h;
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // "VEDI ALTRO" / "SEE MORE" CLICK — v0.7.1
-  //
-  // FB Ads Library sometimes paginates with an explicit "Vedi altro" /
-  // "See more" / "Load more" button instead of pure infinite scroll. The
-  // virtualized list above the button is exhausted; without a click on it,
-  // the scraper plateaus at ~16 cards and never advances. Reported via
-  // screenshot on 2026-05-22 (klarna / SE → 0 ads after 4 cycles, button
-  // "Vedi altro" visible right under the ad grid).
-  //
-  // We sweep every <div role="button">, <a role="button">, <button> on the
-  // page and click the first one whose visible text matches the multilingual
-  // "see more" pattern AND is in (or near) the viewport. Dispatching click
-  // via .click() works on FB's React handlers — they re-attach listeners on
-  // every render, but a plain click event is honored.
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  // One regex per supported locale — case-insensitive. We match permissive
-  // variants like "vedi altro" / "vedi di più" / "mostra altri risultati"
-  // because FB rotates the exact wording across A/B tests.
-  const SEE_MORE_PATTERNS = [
-    /^\s*vedi\s+(altro|di\s+pi[uù]|altri)/i,         // IT
-    /^\s*mostra\s+(altro|di\s+pi[uù]|altri)/i,       // IT alt
-    /^\s*see\s+more/i,                                // EN
-    /^\s*show\s+more/i,                               // EN alt
-    /^\s*load\s+more/i,                               // EN alt
-    /^\s*ver\s+m[aá]s/i,                              // ES
-    /^\s*mostrar\s+m[aá]s/i,                          // ES alt
-    /^\s*voir\s+plus/i,                               // FR
-    /^\s*afficher\s+plus/i,                           // FR alt
-    /^\s*mehr\s+anzeigen/i,                           // DE
-    /^\s*mehr\s+laden/i,                              // DE alt
-    /^\s*meer\s+(bekijken|laden|weergeven)/i,         // NL
-    /^\s*ver\s+mais/i,                                // PT
-  ];
-
-  // Track the last click so we don't hammer the button if FB ignores us.
-  let lastSeeMoreClickAt = 0;
-  const SEE_MORE_CLICK_COOLDOWN_MS = 3000;
-
-  function matchesSeeMore(text) {
-    if (!text || text.length > 60) return false; // long blobs are never the button
-    return SEE_MORE_PATTERNS.some((re) => re.test(text));
-  }
-
-  function isInOrNearViewport(el) {
-    try {
-      const r = el.getBoundingClientRect();
-      const vh = window.innerHeight || document.documentElement.clientHeight;
-      // Within 1.5 viewport-heights of current scroll position (above or below).
-      return r.top < vh * 1.5 && r.bottom > -vh * 0.5 && r.width > 0 && r.height > 0;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Find and click a "Vedi altro" / "See more" pagination button if visible.
-   * Returns true if a click happened, false otherwise.
-   * Throttled at SEE_MORE_CLICK_COOLDOWN_MS to avoid double-firing.
-   */
-  function clickSeeMoreIfPresent() {
-    if (Date.now() - lastSeeMoreClickAt < SEE_MORE_CLICK_COOLDOWN_MS) return false;
-
-    // Cast a wide net: any clickable element with short visible text.
-    const candidates = document.querySelectorAll(
-      'div[role="button"], a[role="button"], button, [aria-label]'
-    );
-    for (const el of candidates) {
-      // Prefer the directly visible text, fall back to aria-label.
-      const txt =
-        (el.textContent || "").trim() ||
-        el.getAttribute("aria-label") ||
-        "";
-      if (!matchesSeeMore(txt)) continue;
-      if (!isInOrNearViewport(el)) continue;
-      // Skip the overlay's own buttons just in case (shadow DOM isolates
-      // them but belt-and-suspenders).
-      if (el.closest("#pegasus-overlay-host")) continue;
-
-      try {
-        el.scrollIntoView({ behavior: "instant", block: "center" });
-        el.click();
-        lastSeeMoreClickAt = Date.now();
-        log(t("cs.log.seeMoreClicked", { text: txt.slice(0, 40) }));
-        return true;
-      } catch {
-        // Click can throw if FB removes the element mid-interaction — silent.
-        return false;
-      }
-    }
-    return false;
-  }
-
   /**
    * Recovery: scroll su in cima, aspetta, poi scroll giù di nuovo.
    * Spesso "sveglia" il lazy-load di FB quando si è incantato.
@@ -1331,14 +1237,7 @@
     window.scrollTo({ top: 0, behavior: "instant" });
     await new Promise((r) => setTimeout(r, 1500));
     window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" });
-    // After the kick is the moment FB is most likely to expose a "Vedi
-    // altro" button (the virtualized list has unloaded everything above
-    // and re-rendered the end-of-results CTA). Reset the cooldown so we
-    // can click it immediately if present.
-    lastSeeMoreClickAt = 0;
-    await new Promise((r) => setTimeout(r, 1000));
-    clickSeeMoreIfPresent();
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, 3000));
   }
 
   function currentCardCount() {
@@ -1543,11 +1442,6 @@
       // 2) Snapshot pre-scroll per detect crescita
       const prevCards = currentCardCount();
       const prevHeight = scrollVariable();
-
-      // 2.5) v0.7.1 — click "Vedi altro" se FB ha smesso di paginare in
-      //      automatico e mostra il bottone. Throttled internamente al
-      //      cooldown, quindi safe da chiamare ogni ciclo.
-      clickSeeMoreIfPresent();
 
       // 3) Aspetta che nuove card appaiano o il page-height cresca (max 8s)
       const grew = await waitForNewContent(prevCards, prevHeight);

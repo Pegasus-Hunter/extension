@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Pegasus Hunter",
   "short_name": "Pegasus",
-  "version": "0.7.1",
+  "version": "0.7.0",
   "description": "Scansiona Facebook Ads Library a velocità doppia con IntersectionObserver + flush parallelo. Estrae 12+ campi per ad (video, CTA, headline, libraryId, piattaforme), traccia Shopify/Woo/BigCommerce/Wix/Squarespace/ClickFunnels. Multi-keep-alive (audio/WebRTC/WakeLock), auto-resume da crash, retry esponenziale, queue mode offline. Steroids Edition.",
   "permissions": [
     "storage",
