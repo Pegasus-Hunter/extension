@@ -506,6 +506,71 @@
     flushTimer = null;
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // "VEDI ALTRO" / "SEE MORE" CLICK — v0.7.3 (surgical, only this)
+  //
+  // On some result sets FB Ads Library paginates with an explicit "Vedi altro"
+  // button instead of pure infinite scroll. Without a click, the scraper sits
+  // at ~12-16 cards and never advances. Surgical addition on top of the
+  // stable v0.6.0 codebase — no other behavior changes.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  const SEE_MORE_PATTERNS = [
+    /^\s*vedi\s+(altro|di\s+pi[uù]|altri)/i,         // IT
+    /^\s*mostra\s+(altro|di\s+pi[uù]|altri)/i,       // IT alt
+    /^\s*see\s+more/i,                                // EN
+    /^\s*show\s+more/i,                               // EN alt
+    /^\s*load\s+more/i,                               // EN alt
+    /^\s*ver\s+m[aá]s/i,                              // ES
+    /^\s*mostrar\s+m[aá]s/i,                          // ES alt
+    /^\s*voir\s+plus/i,                               // FR
+    /^\s*afficher\s+plus/i,                           // FR alt
+    /^\s*mehr\s+anzeigen/i,                           // DE
+    /^\s*mehr\s+laden/i,                              // DE alt
+    /^\s*meer\s+(bekijken|laden|weergeven)/i,         // NL
+    /^\s*ver\s+mais/i,                                // PT
+  ];
+  let lastSeeMoreClickAt = 0;
+  const SEE_MORE_CLICK_COOLDOWN_MS = 3000;
+
+  function matchesSeeMore(text) {
+    if (!text || text.length > 60) return false;
+    return SEE_MORE_PATTERNS.some((re) => re.test(text));
+  }
+
+  function isInOrNearViewport(el) {
+    try {
+      const r = el.getBoundingClientRect();
+      const vh = window.innerHeight || document.documentElement.clientHeight;
+      return r.top < vh * 1.5 && r.bottom > -vh * 0.5 && r.width > 0 && r.height > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  function clickSeeMoreIfPresent() {
+    if (Date.now() - lastSeeMoreClickAt < SEE_MORE_CLICK_COOLDOWN_MS) return false;
+    const candidates = document.querySelectorAll(
+      'div[role="button"], a[role="button"], button, [aria-label]'
+    );
+    for (const el of candidates) {
+      const txt = (el.textContent || "").trim() || el.getAttribute("aria-label") || "";
+      if (!matchesSeeMore(txt)) continue;
+      if (!isInOrNearViewport(el)) continue;
+      if (el.closest("#pegasus-overlay-host")) continue;
+      try {
+        el.scrollIntoView({ behavior: "instant", block: "center" });
+        el.click();
+        lastSeeMoreClickAt = Date.now();
+        log(`Cliccato bottone paginazione "${txt.slice(0, 40)}" — FB carica altri risultati.`);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
   function scrollToBottom() {
     const h = document.documentElement.scrollHeight;
     // Primary: window-level scroll. Works when the tab is visible.
@@ -537,7 +602,13 @@
     window.scrollTo({ top: 0, behavior: "instant" });
     await new Promise((r) => setTimeout(r, 1500));
     window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" });
-    await new Promise((r) => setTimeout(r, 3000));
+    // v0.7.3 — recovery is exactly when FB is most likely to re-expose the
+    // "Vedi altro" button (virtualized list has just re-rendered the end).
+    // Reset cooldown so we can click it immediately.
+    lastSeeMoreClickAt = 0;
+    await new Promise((r) => setTimeout(r, 1000));
+    clickSeeMoreIfPresent();
+    await new Promise((r) => setTimeout(r, 2000));
   }
 
   /**
@@ -641,6 +712,10 @@
       // 2) Snapshot pre-scroll per detect crescita
       const prevCards = currentCardCount();
       const prevHeight = scrollToBottom();
+
+      // 2.5) v0.7.3 — click "Vedi altro" if FB shows it. Throttled
+      //      internally, safe to call every cycle.
+      clickSeeMoreIfPresent();
 
       // 3) Aspetta che nuove card appaiano o il page-height cresca (max 8s)
       const grew = await waitForNewContent(prevCards, prevHeight);
