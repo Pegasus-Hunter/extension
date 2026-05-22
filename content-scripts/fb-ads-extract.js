@@ -61,58 +61,6 @@
   // scroll-up + scroll-down per "svegliare" il lazy-load di Facebook.
   const RECOVERY_EVERY_CYCLES = 4;
   let flushTimer = null;
-  let keepAliveHandle = null;
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // KEEP-ALIVE (v0.6.0) — anti-throttling background scraping
-  //
-  // Chrome aggressively throttles setTimeout/setInterval/RAF on non-visible
-  // tabs: a 4 s loop becomes >30 s, virtualized lists like FB Ads Library
-  // stop fetching new pages. A tab that's playing media is exempt from this
-  // throttling. We exploit it by running an inaudible OscillatorNode through
-  // a near-zero gain — Chrome flags the tab as "media-playing" and keeps it
-  // at full speed even minimized.
-  //
-  // The user sees a small audio indicator on the tab icon. Trade-off
-  // accepted: the alternative is "scrape stops the moment you switch tab".
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  function startKeepAlive() {
-    if (keepAliveHandle) return;
-    try {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) {
-        logErr(t("cs.log.keepAliveFail", { err: "AudioContext unavailable" }));
-        return;
-      }
-      const ctx = new AC();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      // 0.0001 ≈ -80 dB — below the audible floor on every consumer device,
-      // but non-zero so Chrome counts the tab as actively producing audio.
-      gain.gain.value = 0.0001;
-      osc.frequency.value = 440;
-      osc.connect(gain).connect(ctx.destination);
-      osc.start();
-      keepAliveHandle = { ctx, osc };
-      // AudioContext may start in "suspended" state under autoplay policy
-      // if no user gesture was captured. The popup click that triggered
-      // PEGASUS_START usually counts; if not, we resume on visibilitychange.
-      if (ctx.state === "suspended") {
-        ctx.resume().catch(() => {});
-      }
-      log(t("cs.log.keepAliveOn"));
-    } catch (e) {
-      logErr(t("cs.log.keepAliveFail", { err: e?.message ?? e }));
-    }
-  }
-
-  function stopKeepAlive() {
-    if (!keepAliveHandle) return;
-    try { keepAliveHandle.osc.stop(); } catch {}
-    try { keepAliveHandle.ctx.close(); } catch {}
-    keepAliveHandle = null;
-  }
 
   function log(...args) {
     chrome.runtime.sendMessage({
@@ -506,90 +454,9 @@
     flushTimer = null;
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // "VEDI ALTRO" / "SEE MORE" CLICK — v0.7.3 (surgical, only this)
-  //
-  // On some result sets FB Ads Library paginates with an explicit "Vedi altro"
-  // button instead of pure infinite scroll. Without a click, the scraper sits
-  // at ~12-16 cards and never advances. Surgical addition on top of the
-  // stable v0.6.0 codebase — no other behavior changes.
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  const SEE_MORE_PATTERNS = [
-    /^\s*vedi\s+(altro|di\s+pi[uù]|altri)/i,         // IT
-    /^\s*mostra\s+(altro|di\s+pi[uù]|altri)/i,       // IT alt
-    /^\s*see\s+more/i,                                // EN
-    /^\s*show\s+more/i,                               // EN alt
-    /^\s*load\s+more/i,                               // EN alt
-    /^\s*ver\s+m[aá]s/i,                              // ES
-    /^\s*mostrar\s+m[aá]s/i,                          // ES alt
-    /^\s*voir\s+plus/i,                               // FR
-    /^\s*afficher\s+plus/i,                           // FR alt
-    /^\s*mehr\s+anzeigen/i,                           // DE
-    /^\s*mehr\s+laden/i,                              // DE alt
-    /^\s*meer\s+(bekijken|laden|weergeven)/i,         // NL
-    /^\s*ver\s+mais/i,                                // PT
-  ];
-  let lastSeeMoreClickAt = 0;
-  const SEE_MORE_CLICK_COOLDOWN_MS = 3000;
-
-  function matchesSeeMore(text) {
-    if (!text || text.length > 60) return false;
-    return SEE_MORE_PATTERNS.some((re) => re.test(text));
-  }
-
-  function isInOrNearViewport(el) {
-    try {
-      const r = el.getBoundingClientRect();
-      const vh = window.innerHeight || document.documentElement.clientHeight;
-      return r.top < vh * 1.5 && r.bottom > -vh * 0.5 && r.width > 0 && r.height > 0;
-    } catch {
-      return false;
-    }
-  }
-
-  function clickSeeMoreIfPresent() {
-    if (Date.now() - lastSeeMoreClickAt < SEE_MORE_CLICK_COOLDOWN_MS) return false;
-    const candidates = document.querySelectorAll(
-      'div[role="button"], a[role="button"], button, [aria-label]'
-    );
-    for (const el of candidates) {
-      const txt = (el.textContent || "").trim() || el.getAttribute("aria-label") || "";
-      if (!matchesSeeMore(txt)) continue;
-      if (!isInOrNearViewport(el)) continue;
-      if (el.closest("#pegasus-overlay-host")) continue;
-      try {
-        el.scrollIntoView({ behavior: "instant", block: "center" });
-        el.click();
-        lastSeeMoreClickAt = Date.now();
-        log(`Cliccato bottone paginazione "${txt.slice(0, 40)}" — FB carica altri risultati.`);
-        return true;
-      } catch {
-        return false;
-      }
-    }
-    return false;
-  }
-
   function scrollToBottom() {
     const h = document.documentElement.scrollHeight;
-    // Primary: window-level scroll. Works when the tab is visible.
     window.scrollTo({ top: h, behavior: "instant" });
-    // Boost (v0.6.0): scrollIntoView on the last card triggers FB's
-    // IntersectionObserver-based lazy-load even when the tab is in
-    // background. Plain window.scrollTo doesn't always do that — FB's
-    // virtualized list listens for an element entering the viewport,
-    // and `scrollIntoView` synthesizes that event reliably.
-    try {
-      const cards = findAdCards();
-      const last = cards[cards.length - 1];
-      if (last && typeof last.scrollIntoView === "function") {
-        last.scrollIntoView({ behavior: "instant", block: "end" });
-        // Re-pin to the absolute bottom so the next cycle still detects
-        // page-height growth correctly.
-        window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" });
-      }
-    } catch {}
     return h;
   }
 
@@ -602,13 +469,7 @@
     window.scrollTo({ top: 0, behavior: "instant" });
     await new Promise((r) => setTimeout(r, 1500));
     window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" });
-    // v0.7.3 — recovery is exactly when FB is most likely to re-expose the
-    // "Vedi altro" button (virtualized list has just re-rendered the end).
-    // Reset cooldown so we can click it immediately.
-    lastSeeMoreClickAt = 0;
-    await new Promise((r) => setTimeout(r, 1000));
-    clickSeeMoreIfPresent();
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, 3000));
   }
 
   /**
@@ -635,65 +496,9 @@
     return false;
   }
 
-  // v0.6.0 — persist scan progress to chrome.storage.local. The service
-  // worker can resurrect a stale scan after a tab crash by reading this.
-  // Best-effort: storage write failure is silent.
-  async function persistProgress() {
-    try {
-      await chrome.storage.local.set({
-        pegasus_scrape_state: {
-          scanning: STATE.scanning,
-          scanId: STATE.scanId,
-          keyword: STATE.keyword,
-          country: STATE.country,
-          limit: STATE.limit,
-          totalFound: STATE.totalFound,
-          cycles: STATE.cycles,
-          // Storing the seen-set lets a future "resume" skip dedup-by-URL.
-          // Cap at ~5000 entries to avoid blowing storage quota (5MB local).
-          seen: Array.from(STATE.seen).slice(-5000),
-          startedAt: STATE.startedAt,
-          timestamp: Date.now(),
-        },
-      });
-    } catch {
-      // Storage quota / disconnected context — non-fatal.
-    }
-  }
-
-  // v0.6.0 — visibilitychange handler. The keep-alive audio prevents most
-  // throttling, but FB's lazy-load occasionally pauses while the tab is
-  // hidden. When the tab is brought back, fire a recovery kick so the
-  // user sees fresh progress the moment they look at the page.
-  function setupVisibilityHandler() {
-    document.addEventListener("visibilitychange", () => {
-      if (!STATE.scanning) return;
-      if (document.visibilityState === "hidden") {
-        log(t("cs.log.visibilityHidden"));
-      } else if (document.visibilityState === "visible") {
-        log(t("cs.log.visibilityVisible"));
-        // Resume the AudioContext if Chrome suspended it (some browsers do
-        // this when the user revokes media autoplay).
-        if (keepAliveHandle?.ctx?.state === "suspended") {
-          keepAliveHandle.ctx.resume().catch(() => {});
-        }
-        // Async fire-and-forget recovery kick + collect.
-        (async () => {
-          await recoveryKick();
-          collectFromVisibleCards();
-        })().catch(() => {});
-      }
-    });
-  }
-
   async function mainLoop() {
     log(t("cs.log.scanStart"));
     startFlushTimer();
-    // v0.6.0 — start anti-throttling audio + visibility handler BEFORE the
-    // first scroll cycle so the tab is exempt from background throttling
-    // from the very first second.
-    startKeepAlive();
-    setupVisibilityHandler();
     // Inject the live overlay UI on top-right of the page. Killer UX of v0.2.0.
     try {
       createOverlay(STATE.keyword, STATE.country);
@@ -712,10 +517,6 @@
       // 2) Snapshot pre-scroll per detect crescita
       const prevCards = currentCardCount();
       const prevHeight = scrollToBottom();
-
-      // 2.5) v0.7.3 — click "Vedi altro" if FB shows it. Throttled
-      //      internally, safe to call every cycle.
-      clickSeeMoreIfPresent();
 
       // 3) Aspetta che nuove card appaiano o il page-height cresca (max 8s)
       const grew = await waitForNewContent(prevCards, prevHeight);
@@ -758,20 +559,12 @@
         sent: Math.max(0, sentCount),
       });
 
-      // 7) Persist progress every cycle so a tab crash doesn't lose state.
-      // Storage write is cheap and async — doesn't block the loop.
-      persistProgress();
-
-      // 8) Pausa con jitter prima del prossimo ciclo (pace anti-detection)
+      // 7) Pausa con jitter prima del prossimo ciclo (pace anti-detection)
       await new Promise((r) => setTimeout(r, jitter(SCROLL_CYCLE_MS)));
     }
 
     stopFlushTimer();
-    stopKeepAlive();
     await flushBatch(true);
-    // Clear persisted state on natural completion so the next scan starts
-    // fresh. (Crash-recovery path would find a non-cleared row and resume.)
-    try { await chrome.storage.local.remove("pegasus_scrape_state"); } catch {}
 
     chrome.runtime.sendMessage({
       type: "PEGASUS_DONE",
