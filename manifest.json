@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Pegasus Hunter",
   "short_name": "Pegasus",
-  "version": "0.8.1",
-  "description": "Scansiona Facebook Ads Library con overlay live, badge contatore sull'icona, retry automatico in caso di rete instabile, e traccia prodotti vincenti su Shopify.",
+  "version": "0.9.0",
+  "description": "Scansiona Facebook Ads Library e cattura libreria inserzioni completa per ogni advertiser: spesa stimata, ads attivi e storici, piattaforme, paesi targeting, creative. Traccia prodotti vincenti su Shopify in parallelo.",
   "permissions": [
     "storage",
     "tabs",

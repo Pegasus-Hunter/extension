@@ -311,15 +311,277 @@
     }
   }
 
-  // Estrae info aggiuntive da una card ad: nome inserzionista, conteggio
-  // "X annunci attivi", immagine principale, se trovabili. Best-effort.
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FB Ads Library extraction (extension v0.9.0+)
+  //
+  // Tre famiglie di campi:
+  //   1) Legacy v0.5.0: advertiser, imageUrl, activeAds — usati da scanner
+  //      di base + dashboard /app/scanner. Devono restare working.
+  //   2) NEW (v0.9.0) — identità ad: libraryId, pageId, pageUrl_fb. Servono
+  //      a deduplicare e linkare gli ad allo stesso advertiser.
+  //   3) NEW (v0.9.0) — timeline & distribution: startDate, platforms[],
+  //      regions[]. Servono al backend per stimare la spesa con CPM × giorni.
+  //
+  // Best-effort: ogni try/catch isolato così se FB cambia un selettore solo
+  // quel campo va a null, il resto resta funzionante. La compatibilità con
+  // server v0.8.x è garantita perché tutti i nuovi campi sono opzionali nel
+  // ScannerItem Pydantic (vedi server/app/routes_pegasus.py).
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Estrai library_id dall'URL "Vedi i dettagli dell'annuncio" o dai link
+  // interni "?id=NNN" della card. FB lo espone come parametro `id` nei link
+  // verso il pannello dettagli — è il primo ancoraggio robusto disponibile.
+  function extractLibraryId(card) {
+    try {
+      const links = card.querySelectorAll('a[href*="/ads/library/?id="], a[href*="?id="]');
+      for (const a of links) {
+        const href = a.getAttribute("href") || "";
+        const m = href.match(/[?&]id=(\d{6,20})/);
+        if (m) return m[1];
+      }
+    } catch {}
+    return null;
+  }
+
+  // Estrai page_id + page_url FB. La card ha sempre 1+ link al profilo FB
+  // della pagina advertiser (es. `/MyShop` o `/profile.php?id=12345`).
+  // Page_id può essere derivato da `?id=` o dallo slug stesso.
+  function extractPageInfo(card) {
+    let pageId = null;
+    let pageName = null;
+    let pageUrl = null;
+    try {
+      // Cerca link a profile FB della pagina. Esclusioni: /ads/library, /l.php,
+      // ancore (#), link esterni.
+      const links = card.querySelectorAll('a[role="link"][href^="/"]');
+      for (const a of links) {
+        const href = a.getAttribute("href") || "";
+        if (!href || href.startsWith("/ads/") || href.startsWith("/l.php") || href.startsWith("#")) continue;
+        const text = (a.textContent || "").trim();
+        if (!text || text.length > 200) continue;
+        // Match: /<slug>/  OR  /profile.php?id=NNN
+        const slugMatch = href.match(/^\/([A-Za-z0-9._-]+)\/?$/);
+        const profileMatch = href.match(/^\/profile\.php\?id=(\d+)/);
+        if (slugMatch) {
+          pageName = pageName || text;
+          pageUrl = pageUrl || `https://www.facebook.com${href}`;
+          // Page_id non si ricava dallo slug; lo proviamo dal data-* attributes.
+          break;
+        } else if (profileMatch) {
+          pageName = pageName || text;
+          pageId = pageId || profileMatch[1];
+          pageUrl = pageUrl || `https://www.facebook.com${href}`;
+          break;
+        }
+      }
+      // Fallback page_id: cerca attributi data-*-id su elementi della card.
+      if (!pageId) {
+        const dataEl = card.querySelector('[data-ad-id], [data-page-id], [data-actor-id]');
+        if (dataEl) {
+          pageId = dataEl.getAttribute("data-page-id") ||
+                   dataEl.getAttribute("data-actor-id") ||
+                   null;
+        }
+      }
+    } catch {}
+    return { pageId, pageName, pageUrl };
+  }
+
+  // Estrai start_date dell'ad. FB lo mostra come "Avviato il 14 nov 2025"
+  // (IT) o "Started running on Nov 14, 2025" (EN) ecc. Regex multilingua
+  // → ISO date. Ritorna null se non trova un match riconoscibile.
+  function extractStartDate(card) {
+    try {
+      const txt = (card.textContent || "");
+      const patterns = [
+        // IT: "Avviato il 14 nov 2025" / "Avviato il 14 novembre 2025"
+        /Avviato\s+il\s+(\d{1,2})\s+([a-zà]{3,12})\s+(\d{4})/i,
+        // EN: "Started running on Nov 14, 2025" / "Active since Nov 14, 2025"
+        /(?:Started running on|Active since)\s+([A-Za-z]{3,12})\s+(\d{1,2}),\s+(\d{4})/i,
+        // ES: "Empezó a publicarse el 14 nov 2025"
+        /Empez[óo]\s+a\s+publicarse\s+el\s+(\d{1,2})\s+([a-záéíóú]{3,12})\s+(\d{4})/i,
+        // FR: "Diffusion lancée le 14 nov 2025"
+        /Diffusion\s+lanc[ée]e\s+le\s+(\d{1,2})\s+([a-zéûï]{3,12})\s+(\d{4})/i,
+        // DE: "Geschaltet seit 14. Nov. 2025"
+        /Geschaltet\s+seit\s+(\d{1,2})\.\s+([A-Za-zäöü]{3,12})\.?\s+(\d{4})/i,
+        // NL: "Gestart op 14 nov 2025"
+        /Gestart\s+op\s+(\d{1,2})\s+([a-z]{3,12})\s+(\d{4})/i,
+      ];
+      const MONTHS = {
+        // IT (full + abbr)
+        gen: 1, gennaio: 1, feb: 2, febbraio: 2, mar: 3, marzo: 3, apr: 4, aprile: 4,
+        mag: 5, maggio: 5, giu: 6, giugno: 6, lug: 7, luglio: 7, ago: 8, agosto: 8,
+        set: 9, settembre: 9, ott: 10, ottobre: 10, nov: 11, novembre: 11, dic: 12, dicembre: 12,
+        // EN
+        jan: 1, january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+        july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+        // FR / ES / DE / NL — common ones already overlap with IT/EN abbr.
+        ene: 1, enero: 1, abr: 4, abril: 4, ago: 8, agosto: 8, sep: 9, sept: 9,
+        oct: 10, dec: 12, dicembre: 12, dezember: 12, mär: 3, mai: 5,
+        jui: 6, juin: 6, juil: 7, juillet: 7, ao: 8, oct: 10, octobre: 10,
+        okt: 10, dez: 12,
+      };
+      for (const re of patterns) {
+        const m = txt.match(re);
+        if (!m) continue;
+        // EN format puts month first: [_, month, day, year]; others put day first.
+        let day, monthStr, year;
+        if (/^(?:Started|Active)/i.test(m[0])) {
+          monthStr = m[1].toLowerCase();
+          day = parseInt(m[2], 10);
+          year = parseInt(m[3], 10);
+        } else {
+          day = parseInt(m[1], 10);
+          monthStr = m[2].toLowerCase().replace(/\.$/, "");
+          year = parseInt(m[3], 10);
+        }
+        const month = MONTHS[monthStr] || MONTHS[monthStr.slice(0, 3)];
+        if (!month || !day || !year || year < 2018 || year > 2099) continue;
+        // Return ISO date "YYYY-MM-DD". Server parses with _parse_iso_date.
+        return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+      }
+    } catch {}
+    return null;
+  }
+
+  // Quali piattaforme servono l'ad? FB mostra icone (FB / IG / Messenger /
+  // Audience Network) sotto il header dell'ad. Le icone hanno aria-label
+  // multilingua riconoscibili.
+  function extractPlatforms(card) {
+    const found = new Set();
+    try {
+      // Strategia 1: aria-label sulle icone piattaforma.
+      const labelled = card.querySelectorAll('[aria-label]');
+      for (const el of labelled) {
+        const label = (el.getAttribute("aria-label") || "").toLowerCase();
+        if (label.includes("facebook")) found.add("facebook");
+        if (label.includes("instagram")) found.add("instagram");
+        if (label.includes("messenger")) found.add("messenger");
+        if (label.includes("audience network") || label.includes("rete pubblicità") ||
+            label.includes("réseau") || label.includes("audience-netzwerk")) {
+          found.add("audience_network");
+        }
+      }
+      // Strategia 2: nomi noti nel testo della card (fallback).
+      if (found.size === 0) {
+        const txt = (card.textContent || "").toLowerCase();
+        if (txt.includes("facebook")) found.add("facebook");
+        if (txt.includes("instagram")) found.add("instagram");
+        if (txt.includes("messenger")) found.add("messenger");
+      }
+    } catch {}
+    return Array.from(found);
+  }
+
+  // Conteggio creative_count: 1 per image/video singolo, ≥2 per carousel.
+  // Cerca thumbnail/dots indicators del carousel.
+  function extractCreativeCount(card) {
+    try {
+      // FB segna i carousel con role="list" o data-pagelet contenenti più
+      // figli che sono <img>/<video>. Approssimazione: contiamo <img> >=200px.
+      const imgs = card.querySelectorAll("img");
+      let bigImgs = 0;
+      for (const img of imgs) {
+        const w = img.naturalWidth || parseInt(img.width, 10) || 0;
+        if (w >= 150) bigImgs++;
+      }
+      const videos = card.querySelectorAll("video").length;
+      return Math.max(1, bigImgs + videos);
+    } catch {}
+    return 1;
+  }
+
+  function extractMediaType(card) {
+    try {
+      if (card.querySelector("video")) {
+        // Carousel può contenere comunque un video — distinguiamo dopo.
+        const count = extractCreativeCount(card);
+        return count > 1 ? "carousel" : "video";
+      }
+      const count = extractCreativeCount(card);
+      if (count > 1) return "carousel";
+      if (card.querySelector("img")) return "image";
+    } catch {}
+    return null;
+  }
+
+  function extractVideoUrl(card) {
+    try {
+      const v = card.querySelector("video[src], video source[src]");
+      if (v) return v.getAttribute("src") || (v.querySelector("source")?.getAttribute("src") ?? null);
+    } catch {}
+    return null;
+  }
+
+  // CTA button: testo del bottone "Acquista ora" / "Shop now" / "Ordina ora".
+  function extractCta(card) {
+    try {
+      // Trova il bottone CTA: di solito è il `[role="button"]` o l'<a> che
+      // contiene il link landing. Prendi il testo se è corto + verbo-azione.
+      const candidates = card.querySelectorAll('[role="button"], a[href]');
+      const ctaPatterns = /^(acquista|ordina|scopri|shop|buy|order|learn|sign|get|book|download|register|install|subscribe|contact|call|view|preorder|app|prenota|chiama)/i;
+      for (const el of candidates) {
+        const t = (el.textContent || "").trim();
+        if (t.length >= 3 && t.length <= 30 && ctaPatterns.test(t)) {
+          return t;
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  // Primary text + body text (i due blocchi principali dell'ad creative).
+  function extractTexts(card) {
+    let primary = null;
+    let body = null;
+    try {
+      // Heuristic: i blocchi testuali "lunghi" dentro la card che non sono
+      // il nome dell'advertiser né la CTA. Prendi i primi 2 più sostanziosi.
+      const texts = card.querySelectorAll('div[dir="auto"], span[dir="auto"]');
+      const blobs = [];
+      for (const t of texts) {
+        const s = (t.textContent || "").trim();
+        if (s.length >= 20 && s.length <= 2000) blobs.push(s);
+      }
+      blobs.sort((a, b) => b.length - a.length);
+      if (blobs[0]) primary = blobs[0].slice(0, 500);
+      if (blobs[1]) body = blobs[1].slice(0, 1500);
+    } catch {}
+    return { primary, body };
+  }
+
+  // Regions: FB indica "Pubblicato in IT, FR" sui meta dell'ad. Multi-lingua.
+  function extractRegions(card) {
+    const out = new Set();
+    try {
+      const txt = card.textContent || "";
+      // Pattern: country code di 2 lettere preceduto da virgola/spazio.
+      // Più affidabile cercare i tag "Pubblicato in"/"Active in"/"Published in".
+      const inPatterns = [
+        /(?:Pubblicato\s+in|Active\s+in|Published\s+in|Diffus[ée]\s+(?:dans|en))\s+([A-Z]{2}(?:\s*,\s*[A-Z]{2})*)/i,
+      ];
+      for (const re of inPatterns) {
+        const m = txt.match(re);
+        if (m) {
+          for (const cc of m[1].split(",")) {
+            const c = cc.trim().toUpperCase();
+            if (c.length === 2) out.add(c);
+          }
+        }
+      }
+    } catch {}
+    return Array.from(out);
+  }
+
+  // Estrae info aggiuntive da una card ad. Wrapper retrocompatibile:
+  // ritorna SEMPRE le 3 chiavi storiche (advertiser, imageUrl, activeAds)
+  // + i nuovi campi v0.9.0. Tutto best-effort, ogni campo isolato in try.
   function extractCardInfo(card) {
     let advertiser = null;
     let imageUrl = null;
     let activeAds = null;
 
     try {
-      // Advertiser: spesso è il primo link a /<page-name> con testo non vuoto
       const advLink = card.querySelector('a[role="link"][href^="/"]');
       if (advLink && advLink.textContent.trim()) {
         advertiser = advLink.textContent.trim().slice(0, 200);
@@ -327,7 +589,6 @@
     } catch {}
 
     try {
-      // Immagine: il primo <img> dentro la card che non sia un avatar piccolo
       const imgs = card.querySelectorAll("img");
       for (const img of imgs) {
         const w = img.naturalWidth || parseInt(img.width, 10) || 0;
@@ -339,15 +600,14 @@
     } catch {}
 
     try {
-      // Active ads: pattern multilingua per "X annunci/ads/advertenties/Anzeigen/anuncios/publicités"
       const txt = card.textContent || "";
       const patterns = [
-        /(\d{1,4})\s+annunci?\s+(usano|attivi|in\s+esecuzione)/i,        // IT
-        /(\d{1,4})\s+ads?\s+(use|active|running)/i,                       // EN
-        /(\d{1,4})\s+advertenties?\s+(gebruik|actief|wordt\s+uitgevoerd)/i, // NL
-        /(\d{1,4})\s+anzeigen?\s+(verwenden|aktiv)/i,                     // DE
-        /(\d{1,4})\s+annonces?\s+(utilisent|actives?)/i,                  // FR
-        /(\d{1,4})\s+anuncios?\s+(utilizan|activos?)/i,                   // ES/PT
+        /(\d{1,4})\s+annunci?\s+(usano|attivi|in\s+esecuzione)/i,
+        /(\d{1,4})\s+ads?\s+(use|active|running)/i,
+        /(\d{1,4})\s+advertenties?\s+(gebruik|actief|wordt\s+uitgevoerd)/i,
+        /(\d{1,4})\s+anzeigen?\s+(verwenden|aktiv)/i,
+        /(\d{1,4})\s+annonces?\s+(utilisent|actives?)/i,
+        /(\d{1,4})\s+anuncios?\s+(utilizan|activos?)/i,
       ];
       for (const p of patterns) {
         const m = txt.match(p);
@@ -358,7 +618,39 @@
       }
     } catch {}
 
-    return { advertiser, imageUrl, activeAds };
+    // v0.9.0 extensions — additive, defensive, all-nullable.
+    const libraryId = extractLibraryId(card);
+    const pageInfo = extractPageInfo(card);
+    const startDate = extractStartDate(card);
+    const platforms = extractPlatforms(card);
+    const regions = extractRegions(card);
+    const mediaType = extractMediaType(card);
+    const creativeCount = extractCreativeCount(card);
+    const videoUrl = extractVideoUrl(card);
+    const ctaText = extractCta(card);
+    const texts = extractTexts(card);
+
+    return {
+      // legacy keys (do not rename — backend + dashboard consume these)
+      advertiser,
+      imageUrl,
+      activeAds,
+      // v0.9.0 — all keys match the ScannerItem Pydantic schema names
+      libraryId,
+      pageId: pageInfo.pageId,
+      pageName: pageInfo.pageName || advertiser,
+      pageUrl_fb: pageInfo.pageUrl,
+      startDate,
+      platforms,
+      regions,
+      mediaType,
+      creativeImageUrl: imageUrl,
+      creativeVideoUrl: videoUrl,
+      creativeCount,
+      ctaText,
+      primaryText: texts.primary,
+      bodyText: texts.body,
+    };
   }
 
   function findAdCards() {
@@ -393,11 +685,41 @@
         if (STATE.seen.has(norm)) continue;
         STATE.seen.add(norm);
         const info = extractCardInfo(card);
+        // Build the batch item: keep the legacy v0.5.0 keys (pageUrl,
+        // advertiser, imageUrl, activeAds) at the top because the scanner
+        // detail page reads them as-is, then spread the v0.9.0 ad-spend
+        // tracking fields. Server tolerates absence of every v0.9.0 key —
+        // they're optional in ScannerItem Pydantic. landingDomain derives
+        // from the normalised pageUrl so the niche detector has something
+        // robust to work with.
+        let landingDomain = null;
+        try {
+          landingDomain = new URL(norm).hostname.replace(/^www\./, "");
+        } catch {}
         STATE.batch.push({
+          // legacy v0.5.0
           pageUrl: norm,
           advertiser: info.advertiser,
           imageUrl: info.imageUrl,
           activeAds: info.activeAds,
+          // v0.9.0 — FB Ads spend tracking
+          libraryId: info.libraryId,
+          pageId: info.pageId,
+          pageName: info.pageName,
+          pageUrl_fb: info.pageUrl_fb,
+          startDate: info.startDate,
+          isActive: true, // keyword-scan only sees active ads
+          platforms: info.platforms,
+          regions: info.regions,
+          mediaType: info.mediaType,
+          creativeImageUrl: info.creativeImageUrl,
+          creativeVideoUrl: info.creativeVideoUrl,
+          creativeCount: info.creativeCount,
+          primaryText: info.primaryText,
+          bodyText: info.bodyText,
+          ctaText: info.ctaText,
+          ctaUrl: norm,
+          landingDomain,
         });
         STATE.totalFound++;
         STATE.sinceLastBatch++;
